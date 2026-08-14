@@ -1561,20 +1561,156 @@ const RECON_BRUSH_SPECS=[
    jitter:{enabled:true,mode:'stamp',hue:0,sat:0,bright:32},
    note:'#15 Powdery soft charcoal — Opacity 20-40%->0.3, Opacity Jitter 25-40%->bright 32, Scatter 20-35%->soft mop + jitter'},
 ];
-function buildReconstructedBrushLibrary(){
-  RECON_BRUSH_SPECS.forEach((spec,idx)=>{
-    const engineForTool={oil:'oil',expressoil:'expressoil',watercolor:'watercolor',ink:'ink',
-      pencil:'dryMedia',pastel:'dryMedia',marker:'marker',airbrush:'airbrush'}[spec.tool]||spec.engine;
-    const key='recon_'+idx+'_'+spec.name.toLowerCase().replace(/[^a-z0-9]+/g,'_');
+/* =========================================================================
+   WATERCOLOR RECONSTRUCTION — 25 brushes, from the user's Rebelle Watercolor
+   library screenshot (Bristle 2, Fan 2, Filbert Dry 2, Flat 3, Flat 4,
+   Flat Dry 2, Liner 3, Liner 4, Mop 2, Round 5, Round 6, Round 7,
+   Wash Flat 2, Wash Round 2, Liner, Liner 2, Round, Round 2, Round 3,
+   Round 4, Flat, Flat 2, Flat Dry, Filbert Dry, Bristle) plus a detailed
+   Brush Creator reconstruction spec (Max Size / Size / Opacity / Water /
+   Size & Opacity Jitter / Pressure curves / Spacing / Scatter / Grain
+   Strength / Smudge & Density / Paint Mode / Mixing Mode per brush).
+   As stated up front by the analysis this is based on: Rebelle's actual
+   saved numbers (Max Size, Jitter, Scatter, Dual-Grain stacking, Follow
+   Shape/Rotation modes, etc.) are NOT recoverable from a rendered image —
+   this is a best-effort visual reconstruction, mapped onto the concrete
+   mechanisms this engine actually has:
+     - Max Size / Size(%) -> maxSize(px) / size(px), scaled down from the
+       screenshot's implied ~500px canvas convention to this engine's
+       working scale (0.4x) so brush footprints land in a sane range.
+     - Opacity/Water(%) -> opacity/water (0-1) directly, no reinterpretation.
+     - Grain Strength(%) -> grain (0-1) AND a matching real procedural grain
+       preset (Fine/Coarse Sponge, Chisel Streaks, Granular Mineral,
+       Spatter Dots) chosen per-brush to match the stated texture character.
+     - Pressure -> Size / Pressure -> Opacity (given as +N modifiers) ->
+       this engine's real sizeBehavior/opacityBehavior curve system
+       ('pressure' for strong modifiers >=40, 'pressure-soft' for
+       moderate 15-39, 'constant' for weak/absent <15 — i.e. a brush
+       ChatGPT gave no meaningful pressure response for stays flat).
+     - Spacing -> brush.spacing directly; this engine already defines
+       spacing the same way Rebelle does (as a % of brush size between
+       stamps), so this is a literal, not approximated, mapping.
+     - Smudge / Smudge Density -> brush.smudgeOnStroke (bool) + a new
+       brush.smudgeDensity (0-100) that now genuinely scales how much
+       extra blending each stamp applies (see the extraBlend fix in
+       depositWet() below) — previously Smudge Density had NO numeric
+       effect at all (only on/off), so this is a real engine addition,
+       not just a stored-but-unused number.
+     - Paint Mode ("Paint & Mix") -> brush.paintMode='paintmix' (the
+       engine's real, already-existing equivalent).
+     - Mixing Mode ("Semi-transparent"/"Transparent") -> brush.mixingMode,
+       using 'transparent' for the wash-family brushes (Mop/Wash Flat/Wash
+       Round, matching their very high Water + very low Grain) and
+       'semitransparent' for everything else, per the source guidance.
+   Features named that have NO equivalent in this engine at all (Angle
+   Jitter, Scatter as true per-stamp position randomization, Follow
+   Shape/Brush Size/Rotation as literal grain-tracking modes, Tip Tilt,
+   Dual Brush/4-slot Shape+Grain stacking) are simply not implemented —
+   flagged here rather than faked. ========================================================================= */
+const WATERCOLOR_RECON_SPECS=[
+ {name:'Recon Bristle 2',shape:'grunge',sizePx:40,maxSizePx:72,opacity:0.55,water:0.12,grain:0.55,flow:0.632,spacing:28,
+  grainGen:['Coarse Sponge',{density:6,detail:6,contrast:6}],smudgeOnStroke:true,smudgeDensity:80,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',mixingMode:'semitransparent'},
+ {name:'Recon Fan 2',shape:'fan',sizePx:53,maxSizePx:88,opacity:0.5,water:0.1,grain:0.35,flow:0.575,spacing:35,
+  grainGen:['Fine Sponge',{density:4,detail:5,contrast:4}],smudgeOnStroke:true,smudgeDensity:75,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',mixingMode:'semitransparent',
+  note:'Size/Opacity/Water (60/50/10) read directly off the screenshot\u2019s Properties panel'},
+ {name:'Recon Filbert Dry 2',shape:'filbert',sizePx:44,maxSizePx:80,opacity:0.65,water:0.06,grain:0.65,flow:0.747,spacing:30,
+  grainGen:['Coarse Sponge',{density:7,detail:6,contrast:7}],smudgeOnStroke:false,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',mixingMode:'semitransparent'},
+ {name:'Recon Flat 3',shape:'flat',sizePx:68,maxSizePx:104,opacity:0.5,water:0.22,grain:0.4,flow:0.575,spacing:18,
+  grainGen:['Fine Sponge',{density:4,detail:6,contrast:5}],smudgeOnStroke:true,smudgeDensity:80,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',mixingMode:'semitransparent'},
+ {name:'Recon Flat 4',shape:'flat',sizePx:67,maxSizePx:112,opacity:0.42,water:0.3,grain:0.25,flow:0.483,spacing:15,
+  grainGen:['Fine Sponge',{density:3,detail:4,contrast:3}],smudgeOnStroke:true,smudgeDensity:85,
+  sizeBehavior:'constant',opacityBehavior:'pressure-soft',mixingMode:'semitransparent'},
+ {name:'Recon Flat Dry 2',shape:'flat',sizePx:51,maxSizePx:92,opacity:0.58,water:0.05,grain:0.7,flow:0.667,spacing:38,
+  grainGen:['Coarse Sponge',{density:7,detail:8,contrast:8}],smudgeOnStroke:false,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',mixingMode:'semitransparent'},
+ {name:'Recon Liner 3',shape:'liner',sizePx:8,maxSizePx:18,opacity:0.7,water:0.08,grain:0.4,flow:0.805,spacing:12,
+  grainGen:['Chisel Streaks',{density:4,detail:5,contrast:4}],smudgeOnStroke:false,
+  sizeBehavior:'pressure',opacityBehavior:'pressure-soft',mixingMode:'semitransparent'},
+ {name:'Recon Liner 4',shape:'liner',sizePx:10,maxSizePx:24,opacity:0.6,water:0.14,grain:0.5,flow:0.69,spacing:18,
+  grainGen:['Chisel Streaks',{density:5,detail:6,contrast:5}],smudgeOnStroke:false,
+  sizeBehavior:'pressure',opacityBehavior:'pressure-soft',mixingMode:'semitransparent'},
+ {name:'Recon Mop 2',shape:'wash',sizePx:96,maxSizePx:160,opacity:0.35,water:0.65,grain:0.15,flow:0.402,spacing:10,
+  grainGen:['Soft Noise',{density:2,detail:2,contrast:2}],smudgeOnStroke:true,smudgeDensity:90,
+  sizeBehavior:'constant',opacityBehavior:'constant',mixingMode:'transparent'},
+ {name:'Recon Round 5',shape:'round',sizePx:48,maxSizePx:88,opacity:0.55,water:0.2,grain:0.45,flow:0.632,spacing:20,
+  grainGen:['Fine Sponge',{density:5,detail:5,contrast:5}],smudgeOnStroke:true,smudgeDensity:50,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',mixingMode:'semitransparent'},
+ {name:'Recon Round 6',shape:'round',sizePx:46,maxSizePx:84,opacity:0.55,water:0.15,grain:0.6,flow:0.632,spacing:30,
+  grainGen:['Coarse Sponge',{density:6,detail:6,contrast:6}],smudgeOnStroke:true,smudgeDensity:50,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',mixingMode:'semitransparent'},
+ {name:'Recon Round 7',shape:'round',sizePx:40,maxSizePx:80,opacity:0.48,water:0.12,grain:0.75,flow:0.552,spacing:42,
+  grainGen:['Spatter Dots',{density:7,detail:7,contrast:7}],smudgeOnStroke:false,
+  sizeBehavior:'constant',opacityBehavior:'constant',mixingMode:'semitransparent',
+  note:'Grain+Spacing matter far more than Water for this stippled/grainy round, per the source analysis'},
+ {name:'Recon Wash Flat 2',shape:'wash',sizePx:104,maxSizePx:160,opacity:0.32,water:0.6,grain:0.2,flow:0.368,spacing:8,
+  grainGen:['Soft Noise',{density:2,detail:2,contrast:2}],smudgeOnStroke:true,smudgeDensity:90,
+  sizeBehavior:'constant',opacityBehavior:'constant',mixingMode:'transparent'},
+ {name:'Recon Wash Round 2',shape:'wash',sizePx:91,maxSizePx:152,opacity:0.3,water:0.68,grain:0.18,flow:0.345,spacing:8,
+  grainGen:['Soft Noise',{density:2,detail:2,contrast:2}],smudgeOnStroke:true,smudgeDensity:90,
+  sizeBehavior:'constant',opacityBehavior:'constant',mixingMode:'transparent'},
+ {name:'Recon Liner',shape:'liner',sizePx:6,maxSizePx:14,opacity:0.7,water:0.1,grain:0.25,flow:0.805,spacing:8,
+  grainGen:['Fine Sponge',{density:2,detail:3,contrast:3}],smudgeOnStroke:false,
+  sizeBehavior:'pressure',opacityBehavior:'pressure-soft',mixingMode:'semitransparent',
+  note:'Cleanest watercolor liner per the source guidance — smallest size, tightest spacing'},
+ {name:'Recon Liner 2',shape:'liner',sizePx:9,maxSizePx:20,opacity:0.55,water:0.05,grain:0.6,flow:0.632,spacing:22,
+  grainGen:['Chisel Streaks',{density:6,detail:7,contrast:6}],smudgeOnStroke:false,
+  sizeBehavior:'pressure',opacityBehavior:'constant',mixingMode:'semitransparent'},
+ {name:'Recon Round',shape:'round',sizePx:44,maxSizePx:80,opacity:0.55,water:0.18,grain:0.35,flow:0.632,spacing:15,
+  grainGen:['Fine Sponge',{density:4,detail:4,contrast:4}],smudgeOnStroke:true,smudgeDensity:50,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',mixingMode:'semitransparent',
+  note:'General-purpose round \u2014 the baseline watercolor brush'},
+ {name:'Recon Round 2',shape:'round',sizePx:46,maxSizePx:84,opacity:0.5,water:0.14,grain:0.6,flow:0.575,spacing:28,
+  grainGen:['Coarse Sponge',{density:6,detail:6,contrast:6}],smudgeOnStroke:true,smudgeDensity:50,
+  sizeBehavior:'pressure-soft',opacityBehavior:'constant',mixingMode:'semitransparent'},
+ {name:'Recon Round 3',shape:'round',sizePx:46,maxSizePx:92,opacity:0.48,water:0.2,grain:0.75,flow:0.552,spacing:32,
+  grainGen:['Granular Mineral',{density:7,detail:5,contrast:7}],smudgeOnStroke:true,smudgeDensity:80,
+  sizeBehavior:'pressure-soft',opacityBehavior:'constant',mixingMode:'semitransparent',
+  note:'Granulating round \u2014 Granular Mineral grain preset for the mineral-pigment separation look'},
+ {name:'Recon Round 4',shape:'round',sizePx:38,maxSizePx:76,opacity:0.6,water:0.07,grain:0.7,flow:0.69,spacing:35,
+  grainGen:['Coarse Sponge',{density:7,detail:7,contrast:7}],smudgeOnStroke:false,
+  sizeBehavior:'pressure-soft',opacityBehavior:'constant',mixingMode:'semitransparent'},
+ {name:'Recon Flat',shape:'flat',sizePx:58,maxSizePx:96,opacity:0.55,water:0.2,grain:0.4,flow:0.632,spacing:18,
+  grainGen:['Fine Sponge',{density:4,detail:5,contrast:4}],smudgeOnStroke:true,smudgeDensity:50,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',mixingMode:'semitransparent',
+  note:'General-purpose flat watercolor'},
+ {name:'Recon Flat 2',shape:'flat',sizePx:53,maxSizePx:96,opacity:0.55,water:0.15,grain:0.6,flow:0.632,spacing:28,
+  grainGen:['Coarse Sponge',{density:6,detail:6,contrast:6}],smudgeOnStroke:true,smudgeDensity:50,
+  sizeBehavior:'pressure-soft',opacityBehavior:'constant',mixingMode:'semitransparent'},
+ {name:'Recon Flat Dry',shape:'flat',sizePx:48,maxSizePx:88,opacity:0.65,water:0.05,grain:0.7,flow:0.747,spacing:35,
+  grainGen:['Coarse Sponge',{density:7,detail:7,contrast:7}],smudgeOnStroke:false,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',mixingMode:'semitransparent'},
+ {name:'Recon Filbert Dry',shape:'filbert',sizePx:46,maxSizePx:84,opacity:0.6,water:0.06,grain:0.65,flow:0.69,spacing:32,
+  grainGen:['Coarse Sponge',{density:6,detail:7,contrast:6}],smudgeOnStroke:false,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',mixingMode:'semitransparent'},
+ {name:'Recon Bristle',shape:'grunge',sizePx:42,maxSizePx:76,opacity:0.6,water:0.1,grain:0.65,flow:0.69,spacing:30,
+  grainGen:['Coarse Sponge',{density:7,detail:6,contrast:6}],smudgeOnStroke:true,smudgeDensity:80,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',mixingMode:'semitransparent',
+  note:'Stronger, denser bristle version per the source guidance'},
+];
+// Shared builder for any reconstruction spec table (used by both the graphite/charcoal/
+// dry-brush family above and the watercolor family below) — pulled out so both sets go
+// through IDENTICAL logic instead of two near-duplicate implementations that could drift.
+function buildBrushesFromReconSpecs(specs,groupName,keyPrefix,defaultTool,defaultEngine){
+  specs.forEach((spec,idx)=>{
+    const tool=spec.tool||defaultTool;
+    const engineForTool=spec.engine||{oil:'oil',expressoil:'expressoil',watercolor:'watercolor',ink:'ink',
+      pencil:'dryMedia',pastel:'dryMedia',marker:'marker',airbrush:'airbrush'}[tool]||defaultEngine;
+    const key=keyPrefix+'_'+idx+'_'+spec.name.toLowerCase().replace(/[^a-z0-9]+/g,'_');
     const b={
-      name:spec.name, group:'Reconstructed (from sample sheet)', tool:spec.tool, engine:engineForTool,
-      shape:spec.shape, size:spec.sizePx, maxSize:clamp(spec.sizePx*6,60,900),
-      opacity:spec.opacity, flow:spec.flow, water:spec.water, blend:spec.blend,
-      grain:spec.grain, pigment:spec.pigment,
+      name:spec.name, group:groupName, tool, engine:engineForTool,
+      shape:spec.shape, size:spec.sizePx, maxSize:spec.maxSizePx!=null?spec.maxSizePx:clamp(spec.sizePx*6,60,900),
+      opacity:spec.opacity, flow:spec.flow, water:spec.water, blend:spec.blend!=null?spec.blend:0.3,
+      grain:spec.grain, pigment:spec.pigment!=null?spec.pigment:0.2,
       loading:spec.loading!=null?spec.loading:82, oiliness:spec.oiliness!=null?spec.oiliness:55,
       spacing:spec.spacing, tolerance:20,
-      sizeBehavior:'pressure', opacityBehavior:'pressure-soft', tipTilt:0, brushForm:0,
-      smudgeOnStroke:false, length:100, mixingMode:'transparent',
+      sizeBehavior:spec.sizeBehavior||'pressure', opacityBehavior:spec.opacityBehavior||'pressure-soft',
+      tipTilt:0, brushForm:0,
+      smudgeOnStroke:!!spec.smudgeOnStroke, smudgeDensity:spec.smudgeDensity!=null?spec.smudgeDensity:80,
+      length:100, mixingMode:spec.mixingMode||'transparent', paintMode:spec.paintMode||'paintmix',
       jitter:spec.jitter?{...spec.jitter}:{enabled:false,mode:'stamp',hue:0,sat:0,bright:0},
       key, reconstructedFromSheet:true, reconstructionNote:spec.note,
     };
@@ -1586,8 +1722,12 @@ function buildReconstructedBrushLibrary(){
       const built=buildGrainTextureFor(spec.grainGen[0],spec.grainGen[1]);
       if(built){ b.grainTex=built.tex; b.grainTexURL=built.url; b.grainInvert=false; b.grainPresetName=built.presetName; b.grainParams=built.params; }
     }
-    addBrushToLibrary(b,spec.tool,false); // false = don't persist to storage; this is built-in library content, regenerated fresh every load
+    addBrushToLibrary(b,tool,false); // false = don't persist to storage; this is built-in library content, regenerated fresh every load
   });
+}
+function buildReconstructedBrushLibrary(){
+  buildBrushesFromReconSpecs(RECON_BRUSH_SPECS,'Reconstructed (from sample sheet)','recon',null,null);
+  buildBrushesFromReconSpecs(WATERCOLOR_RECON_SPECS,'Reconstructed Watercolor (from library screenshot)','reconwc','watercolor','watercolor');
 }
 
 /* ---- Brush Preset (JSON) export / import — our own open, documented format ---- */
@@ -2572,7 +2712,14 @@ function depositWet(L,x,y,pressure,angle,speed,b,bias){
     }
     L.edge[i]=clamp(L.edge[i]+amount*(1-fall)*0.05,0,1);
   });
-  const extraBlend = mode==='paintblend' ? (1-pressure)*0.22 : (b.smudgeOnStroke? 0.10 : 0);
+  // Smudge Density previously had NO numeric effect — brush.smudgeOnStroke only ever
+  // contributed a fixed 0.10 blend regardless of what Density value was stored, so setting
+  // e.g. 50 vs. 90 (as several reconstructed watercolor brushes specify) did nothing. Now
+  // scales the actual per-dab smear amount so higher Density brushes genuinely blend/soften
+  // their own edges more between adjacent dabs, matching Rebelle's documented behavior of
+  // Smudge Density controlling how strongly a brush drags/mixes color as it strokes.
+  const smudgeDensityMul = b.smudgeOnStroke ? clamp((b.smudgeDensity!=null?b.smudgeDensity:80)/100,0,1) : 0;
+  const extraBlend = mode==='paintblend' ? (1-pressure)*0.22 : (b.smudgeOnStroke? 0.06+smudgeDensityMul*0.16 : 0);
   if(extraBlend>0 && strokeState.lastStamp){
     smearAt(L,x,y,strokeState.lastStamp.x,strokeState.lastStamp.y,pressure,b,extraBlend);
   }
