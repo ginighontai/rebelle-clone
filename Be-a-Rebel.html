@@ -1623,15 +1623,20 @@ function findEmbeddedBrushJSON(chunks){
 // a genuinely different footprint instead of always defaulting to round.
 function shapeFromFileName(name){
   const n=name.toLowerCase();
-  if(/liner|rigger|nib|line|fine|thin|hair/.test(n)) return 'liner';
-  if(/flat|bright|chisel|comb/.test(n)) return 'flat';
-  if(/filbert|blunt/.test(n)) return 'filbert';
-  if(/fan/.test(n)) return 'fan';
-  if(/mop|wash|cloud|glaze|bg|background/.test(n)) return 'mop';
-  if(/knife|palette/.test(n)) return 'knife';
-  if(/splat|spatter|spray|drip|drop/.test(n)) return 'splat';
-  if(/grunge|shred|rough|texture|grain|rock|stone/.test(n)) return 'grunge';
-  return 'round';
+  if(/liner|rigger|nib|line|fine|thin|hair|detail|script|calligrap/.test(n)) return 'liner';
+  if(/flat|bright|chisel|comb|marker|square|edge/.test(n)) return 'flat';
+  if(/filbert|blunt|oval/.test(n)) return 'filbert';
+  if(/fan|feather/.test(n)) return 'fan';
+  if(/mop|wash|cloud|glaze|bg|background|leaf|petal|foliage|sky|soft.?blend|blender/.test(n)) return 'mop';
+  if(/knife|palette|smear/.test(n)) return 'knife';
+  if(/splat|spatter|spray|drip|drop|splash|speckle|fleck/.test(n)) return 'splat';
+  if(/grunge|shred|rough|texture|grain|rock|stone|coarse|dirty|distress|scratch/.test(n)) return 'grunge';
+  // No keyword matched at all: rather than every unlabeled brush collapsing onto the same
+  // 'round' footprint (which is what made 3 of 4 test brushes look identical), pick a real,
+  // varied footprint deterministically from the name itself so different unlabeled files
+  // still get visually distinct tip shapes, not just slightly different numbers on the same tip.
+  const FALLBACK_SHAPES=['round','filbert','mop','flat'];
+  return FALLBACK_SHAPES[Math.floor(hashString(name)*FALLBACK_SHAPES.length)%FALLBACK_SHAPES.length];
 }
 // Deterministic 0..1 hash of a string (same input always produces the same output) — used to
 // nudge numeric brush parameters within a real range so two files sharing a shape category
@@ -2760,7 +2765,12 @@ function setStatus(t){ const el=document.getElementById('statusText'); if(el) el
 function updatePressureReadout(p){
   const el=document.getElementById('pressureReadout'); if(!el) return;
   if(!p){ el.textContent=''; return; }
-  el.textContent=(p.pointerType||'mouse')+' · pressure '+(p.rawPressure!=null?p.rawPressure.toFixed(2):'—');
+  const isMouse=(p.pointerType||'mouse')==='mouse';
+  const label=isMouse
+    ? 'mouse — no pressure hardware, strokes are constant-width by design (use a pen/tablet for taper)'
+    : (p.pointerType||'mouse')+' · pressure '+(p.rawPressure!=null?p.rawPressure.toFixed(2):'—');
+  el.textContent=label;
+  el.style.color=isMouse?'#f2b400':'';
 }
 
 /* ---------- pointer / stroke handling ---------- */
