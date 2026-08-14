@@ -1399,6 +1399,28 @@ const SHAPE_GENERATORS={
     for(let a=0;a<=Math.PI*2+0.1;a+=0.12){ const r=base+(noise(Math.cos(a)*3+seedOff,Math.sin(a)*3-seedOff)-0.5)*base*jag*2; const x=cx+Math.cos(a)*r,y=cy+Math.sin(a)*r; if(a===0) g.moveTo(x,y); else g.lineTo(x,y); }
     g.closePath(); g.fill();
   },
+  // Cross Hatch: two overlapping sets of near-diagonal strokes at different angles, the
+  // closest honest approximation this engine has for a "dual brush" cross-hatched mark
+  // (there's no real two-brush compositing system here) — Detail controls how many strokes
+  // per direction, Contrast controls line weight/opacity, Density adds slight length jitter.
+  'Cross Hatch':(g,s,p,rnd)=>{
+    g.fillStyle='#000'; g.fillRect(0,0,s,s); g.strokeStyle='#fff'; g.lineCap='round';
+    const linesPerSet=Math.max(3,Math.round(3+p.detail*1.3));
+    const drawSet=(angle)=>{
+      for(let i=0;i<linesPerSet;i++){
+        const t=(i+0.5)/linesPerSet;
+        const offset=(t-0.5)*s*1.35;
+        const cx=s/2+Math.cos(angle+Math.PI/2)*offset, cy=s/2+Math.sin(angle+Math.PI/2)*offset;
+        const len=s*(0.95+(rnd()-0.5)*0.12*(p.density/10));
+        const dx=Math.cos(angle)*len/2, dy=Math.sin(angle)*len/2;
+        g.lineWidth=1+(p.contrast/10)*2.4+rnd()*0.6;
+        g.globalAlpha=0.6+rnd()*0.4;
+        g.beginPath(); g.moveTo(cx-dx,cy-dy); g.lineTo(cx+dx,cy+dy); g.stroke();
+      }
+    };
+    drawSet(Math.PI*0.20); drawSet(-Math.PI*0.22);
+    g.globalAlpha=1;
+  },
 };
 function applyProceduralShape(name,params){
   if(!brush) return;
@@ -1411,6 +1433,161 @@ function applyProceduralShape(name,params){
   brush.shapeTex=extractCoverageTexture(g,size,size,false);
   brush.shapeTexURL=c.toDataURL('image/png'); brush.shapeInvert=false; brush.shapePresetName=name; brush.shapeParams=p;
   buildBrushCreator(); updateStrokePreview(); setStatus('Shape: "'+name+'" applied to "'+brush.name+'"');
+}
+
+/* =========================================================================
+   RECONSTRUCTED BRUSH LIBRARY — from a user-supplied Rebelle stroke sample
+   sheet (15 brushes across 4 families: Graphite/Pencil, Charcoal, Dry
+   Brush/Bristle, Cross-Hatch) analyzed visually (ChatGPT reverse-engineering
+   of the stroke marks, not Rebelle's actual saved parameters — Rebelle
+   doesn't expose those from a rendered image, so this is a best-effort
+   reconstruction, same honest caveat as the PNG-brush-import feature).
+   The source analysis gave RANGES per parameter (e.g. "Opacity 45-60%,
+   Spacing 8-15%"); each brush below picks ONE concrete value from inside
+   its stated range (documented per-brush below) so every brush is fully
+   playable immediately, and the 15 are numerically distinct from each
+   other rather than converging on shared defaults.
+   Mapping notes (what's real vs. approximated in THIS engine):
+     - "Grain Depth/Contrast/Rotation" -> this engine's grain 0-1 slider +
+       a matching procedural GRAIN_GENERATORS preset (real, same mechanism
+       used by the Brush Creator grain picker).
+     - "Follow Trajectory" (grain rotates with stroke direction) has no
+       literal switch in this engine; approximated by using an elongated
+       liner/knife footprint so the dab itself already reads as directional.
+     - "Scatter" / "Opacity Jitter" -> mapped to this engine's real
+       brush.jitter system (enabled + bright/sat amount) where it's a close
+       match; true per-stamp position scatter has no equivalent and is
+       instead approximated via grain roughness + spacing.
+     - "Dual Brush" (brush #14 cross-hatch) -> the new 'Cross Hatch'
+       procedural shape generator above is used directly as the tip, since
+       there's no two-brush compositing pipeline in this engine.
+     - "Bristle Pressure variation" (brush family C) -> mapped to the oil
+       engine's real per-bristle wear/jitter system (makeBristles()), which
+       already varies coverage per bristle per stroke.
+   ========================================================================= */
+// Builds a procedural shape/grain texture pair for an ARBITRARY brush object under
+// construction (unlike applyProceduralShape/applyProceduralGrain, which mutate the
+// currently-selected UI `brush` — these are pure functions safe to call at library-init time).
+function buildShapeTextureFor(name,params){
+  const gen=SHAPE_GENERATORS[name]; if(!gen) return null;
+  const p=Object.assign({},SHAPE_DEFAULTS,params);
+  const size=160, {c,g}=proceduralCanvas(size);
+  const rnd=seededRandom(2000+p.seed*777);
+  g.clearRect(0,0,size,size);
+  gen(g,size,p,rnd);
+  return {tex:extractCoverageTexture(g,size,size,false),url:c.toDataURL('image/png'),presetName:name,params:p};
+}
+function buildGrainTextureFor(name,params){
+  const gen=GRAIN_GENERATORS[name]; if(!gen) return null;
+  const p=Object.assign({},GRAIN_DEFAULTS,params);
+  const size=160, {c,g}=proceduralCanvas(size);
+  const rnd=seededRandom(1000+p.seed*777);
+  gen(g,size,p,rnd);
+  return {tex:extractLumTexture(g,size,size,false),url:c.toDataURL('image/png'),presetName:name,params:p};
+}
+// Reconstruction spec table. Each entry: which tool/engine, the concrete numeric values
+// (chosen from inside the analysis's stated range), and which procedural shape/grain preset
+// to attach. `sizePx` converts the analysis's "Size %" (relative to a max brush size) into a
+// concrete on-canvas pixel size appropriate for this engine's scale.
+const RECON_BRUSH_SPECS=[
+  // --- Family A: Graphite / Pencil (#1-4) ---
+  {name:'Recon Graphite Hatch Fine',tool:'pencil',engine:'dryMedia',shape:'liner',sizePx:9,
+   opacity:0.52,flow:0.6,water:0,grain:0.62,pigment:0.5,blend:0.08,spacing:9,
+   shapeGen:null,grainGen:['Fine Sponge',{density:6,detail:7,contrast:4}],
+   note:'#1 Dry pencil/graphite hatch — Opacity 45-60%->0.52, Spacing 8-15%->9, Grain Depth 60-80%->0.62'},
+  {name:'Recon Graphite Soft',tool:'pencil',engine:'dryMedia',shape:'round',sizePx:11,
+   opacity:0.37,flow:0.55,water:0,grain:0.55,pigment:0.4,blend:0.14,spacing:13,
+   shapeGen:null,grainGen:['Fine Sponge',{density:4,detail:5,contrast:3}],
+   note:'#2 Soft graphite pencil — Opacity 30-45%->0.37, Spacing 10-18%->13, low jitter'},
+  {name:'Recon Graphite Light',tool:'pencil',engine:'dryMedia',shape:'round',sizePx:8,
+   opacity:0.22,flow:0.45,water:0,grain:0.7,pigment:0.32,blend:0.06,spacing:10,
+   shapeGen:null,grainGen:['Fine Sponge',{density:3,detail:8,contrast:5}],
+   note:'#3 Very light dry pencil — Opacity 15-30%->0.22, very fine grain, high texture influence'},
+  {name:'Recon Graphite Broad',tool:'pencil',engine:'dryMedia',shape:'filbert',sizePx:16,
+   opacity:0.27,flow:0.5,water:0,grain:0.4,pigment:0.3,blend:0.1,spacing:20,
+   shapeGen:null,grainGen:['Soft Noise',{density:5,detail:4,contrast:3}],
+   note:'#4 Broad light graphite — Size 30-45%->16px, Opacity 20-35%->0.27, large soft grain'},
+  // --- Family B: Charcoal (#5-8) ---
+  {name:'Recon Charcoal Dark',tool:'pastel',engine:'dryMedia',shape:'knife',sizePx:18,
+   opacity:0.72,flow:0.75,water:0,grain:0.55,pigment:0.62,blend:0.1,spacing:7,
+   shapeGen:null,grainGen:['Coarse Sponge',{density:6,detail:6,contrast:7}],
+   note:'#5 Dark dry charcoal/pencil — Opacity 65-80%->0.72, Spacing 5-10%->7, coarse grain'},
+  {name:'Recon Charcoal Heavy',tool:'pastel',engine:'dryMedia',shape:'knife',sizePx:22,
+   opacity:0.85,flow:0.85,water:0,grain:0.68,pigment:0.72,blend:0.08,spacing:6,
+   shapeGen:null,grainGen:['Coarse Sponge',{density:8,detail:7,contrast:9}],
+   jitter:{enabled:true,mode:'stamp',hue:0,sat:0,bright:10},
+   note:'#6 Heavy charcoal — Opacity 75-95%->0.85, coarse irregular grain, Angle/Scatter->jitter bright 10'},
+  {name:'Recon Charcoal Block',tool:'pastel',engine:'dryMedia',shape:'grunge',sizePx:24,
+   opacity:0.95,flow:0.9,water:0,grain:0.85,pigment:0.85,blend:0.05,spacing:5,
+   shapeGen:null,grainGen:['Coarse Sponge',{density:9,detail:8,contrast:9}],
+   note:'#7 Dense charcoal block — Opacity 90-100%->0.95, Grain Depth 80-100%->0.85, low spacing'},
+  {name:'Recon Charcoal Powder',tool:'pastel',engine:'dryMedia',shape:'mop',sizePx:28,
+   opacity:0.34,flow:0.5,water:0,grain:0.3,pigment:0.4,blend:0.2,spacing:15,
+   shapeGen:null,grainGen:['Soft Noise',{density:4,detail:3,contrast:2}],
+   jitter:{enabled:true,mode:'stamp',hue:0,sat:0,bright:28},
+   note:'#8 Powdery charcoal — Opacity 25-45%->0.34, Opacity Jitter 20-35%->bright 28, Scatter->soft mop shape'},
+  // --- Family C: Dry Brush / Bristle (#9-13) ---
+  {name:'Recon Dry Smudge',tool:'oil',engine:'oil',shape:'knife',sizePx:18,
+   opacity:0.55,flow:0.6,water:0,grain:0.4,pigment:0.5,blend:0.3,loading:75,oiliness:35,spacing:9,
+   shapeGen:null,grainGen:['Chisel Streaks',{density:6,detail:6,contrast:5}],
+   note:'#9 Dry smudged charcoal — elongated grain via Chisel Streaks, Follow Trajectory approximated by knife shape'},
+  {name:'Recon Sharp Dry Marker',tool:'oil',engine:'oil',shape:'knife',sizePx:16,
+   opacity:0.88,flow:0.85,water:0,grain:0.3,pigment:0.75,blend:0.12,loading:90,oiliness:20,spacing:5,
+   shapeGen:null,grainGen:['Chisel Streaks',{density:8,detail:8,contrast:7}],
+   note:'#10 Sharp dry marker/charcoal — Opacity 80-95%->0.88, hard grain, Follow Trajectory via knife shape'},
+  {name:'Recon Rough Charcoal Heavy',tool:'oil',engine:'oil',shape:'grunge',sizePx:22,
+   opacity:0.95,flow:0.9,water:0,grain:0.9,pigment:0.85,blend:0.1,loading:95,oiliness:15,spacing:4,
+   shapeGen:null,grainGen:['Coarse Sponge',{density:9,detail:9,contrast:9}],
+   jitter:{enabled:true,mode:'bristle',hue:0,sat:0,bright:8},
+   note:'#11 Heavy rough charcoal — Grain Contrast 80-100%->0.9, Scatter->per-bristle jitter'},
+  {name:'Recon Rough Bristle',tool:'oil',engine:'oil',shape:'flat',sizePx:20,
+   opacity:0.82,flow:0.75,water:0,grain:0.5,pigment:0.65,blend:0.2,loading:85,oiliness:30,spacing:6,
+   shapeGen:null,grainGen:['Chisel Streaks',{density:7,detail:9,contrast:6}],
+   jitter:{enabled:true,mode:'bristle',hue:0,sat:0,bright:6},
+   note:'#12 Rough bristle/charcoal — real per-bristle wear/jitter from oil engine (multi-bristle, pressure varies coverage)'},
+  {name:'Recon Dry Brush Broken',tool:'oil',engine:'oil',shape:'flat',sizePx:17,
+   opacity:0.75,flow:0.68,water:0,grain:0.55,pigment:0.55,blend:0.24,loading:78,oiliness:38,spacing:8,
+   shapeGen:null,grainGen:['Chisel Streaks',{density:5,detail:9,contrast:5}],
+   note:'#13 Dry brush / broken ink — bristle count ~15-30 via flat-shape bristle array, high length variation'},
+  // --- Family D: Cross-Hatch / Dual Brush (#14) ---
+  {name:'Recon Cross Hatch',tool:'ink',engine:'ink',shape:'round',sizePx:26,
+   opacity:0.82,flow:0.8,water:0.1,grain:0.35,pigment:0.7,blend:0.08,spacing:8,
+   shapeGen:['Cross Hatch',{density:6,detail:7,contrast:7}],grainGen:null,
+   note:'#14 Cross-hatched dry brush — approximated via Cross Hatch procedural SHAPE (two angled stroke sets baked into the tip), since this engine has no literal Dual Brush compositing'},
+  // --- #15 ---
+  {name:'Recon Charcoal Soft Powder',tool:'pastel',engine:'dryMedia',shape:'mop',sizePx:34,
+   opacity:0.3,flow:0.45,water:0,grain:0.25,pigment:0.35,blend:0.25,spacing:16,
+   shapeGen:null,grainGen:['Soft Noise',{density:3,detail:3,contrast:2}],
+   jitter:{enabled:true,mode:'stamp',hue:0,sat:0,bright:32},
+   note:'#15 Powdery soft charcoal — Opacity 20-40%->0.3, Opacity Jitter 25-40%->bright 32, Scatter 20-35%->soft mop + jitter'},
+];
+function buildReconstructedBrushLibrary(){
+  RECON_BRUSH_SPECS.forEach((spec,idx)=>{
+    const engineForTool={oil:'oil',expressoil:'expressoil',watercolor:'watercolor',ink:'ink',
+      pencil:'dryMedia',pastel:'dryMedia',marker:'marker',airbrush:'airbrush'}[spec.tool]||spec.engine;
+    const key='recon_'+idx+'_'+spec.name.toLowerCase().replace(/[^a-z0-9]+/g,'_');
+    const b={
+      name:spec.name, group:'Reconstructed (from sample sheet)', tool:spec.tool, engine:engineForTool,
+      shape:spec.shape, size:spec.sizePx, maxSize:clamp(spec.sizePx*6,60,900),
+      opacity:spec.opacity, flow:spec.flow, water:spec.water, blend:spec.blend,
+      grain:spec.grain, pigment:spec.pigment,
+      loading:spec.loading!=null?spec.loading:82, oiliness:spec.oiliness!=null?spec.oiliness:55,
+      spacing:spec.spacing, tolerance:20,
+      sizeBehavior:'pressure', opacityBehavior:'pressure-soft', tipTilt:0, brushForm:0,
+      smudgeOnStroke:false, length:100, mixingMode:'transparent',
+      jitter:spec.jitter?{...spec.jitter}:{enabled:false,mode:'stamp',hue:0,sat:0,bright:0},
+      key, reconstructedFromSheet:true, reconstructionNote:spec.note,
+    };
+    if(spec.shapeGen){
+      const built=buildShapeTextureFor(spec.shapeGen[0],spec.shapeGen[1]);
+      if(built){ b.shapeTex=built.tex; b.shapeTexURL=built.url; b.shapeInvert=false; b.shapePresetName=built.presetName; b.shapeParams=built.params; }
+    }
+    if(spec.grainGen){
+      const built=buildGrainTextureFor(spec.grainGen[0],spec.grainGen[1]);
+      if(built){ b.grainTex=built.tex; b.grainTexURL=built.url; b.grainInvert=false; b.grainPresetName=built.presetName; b.grainParams=built.params; }
+    }
+    addBrushToLibrary(b,spec.tool,false); // false = don't persist to storage; this is built-in library content, regenerated fresh every load
+  });
 }
 
 /* ---- Brush Preset (JSON) export / import — our own open, documented format ---- */
@@ -1461,8 +1638,11 @@ async function deserializeBrush(o){
 function addBrushToLibrary(b,tool,persist){
   tool=tool||b.tool; if(!BRUSH_SETS[tool]) tool='watercolor';
   b.tool=tool;
-  if(!BRUSH_SETS[tool].groups['My Brushes']) BRUSH_SETS[tool].groups['My Brushes']=[];
-  BRUSH_SETS[tool].groups['My Brushes'].push(b);
+  const groupName=b.group||'My Brushes'; // respect a brush's own declared group (e.g. the
+                                          // reconstructed-library group) instead of always
+                                          // dumping every added brush into "My Brushes"
+  if(!BRUSH_SETS[tool].groups[groupName]) BRUSH_SETS[tool].groups[groupName]=[];
+  BRUSH_SETS[tool].groups[groupName].push(b);
   BRUSH_SETS[tool].flat[b.key]=b; BRUSH_INDEX[b.key]=b;
   if(persist!==false) persistMyBrushes();
 }
@@ -6068,6 +6248,7 @@ function init(){
   buildPaper();
   symmetry.cx=W/2; symmetry.cy=H/2;
   perspectiveRuler.vp1={x:W/2,y:H*0.3}; perspectiveRuler.vp2={x:W*0.15,y:H*0.3};
+  buildReconstructedBrushLibrary();
   setBrush(DEFAULT_BRUSH_FOR_TOOL['watercolor'],false);
   rebuildAllUI();
   initPanelChrome();
