@@ -131,19 +131,23 @@ select{background:var(--input-bg);border:1px solid var(--line);color:var(--text)
    two-row grid of action-tool icons below (Blend, Clone, Eraser, Fill, Pick, Undo /
    Water, Dry, Blow, Selection, Transform, Canvas Size, Redo) — matching the manual's
    own toolbar grouping instead of one flat undifferentiated 4-column grid of everything. */
-.toolsPaintRow{display:grid;grid-template-columns:repeat(3,1fr);gap:5px;margin-bottom:2px}
-.toolPaintBtn{aspect-ratio:1;border:1px solid #5a6270;background:#454b56;border-radius:7px;color:#eaf0f8;
-  display:grid;place-items:center;padding:6px;position:relative}
-.toolPaintBtn svg{width:24px;height:24px;stroke:currentColor;fill:none;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
+/* Compact toolbar: real Rebelle's Tools panel reads as a dense, small icon grid (see
+   manual "Understanding Tools, Brushes, and their Properties" / Interface overview) — not
+   large 70px+ squares. Icons shrunk substantially and packed into more columns so the whole
+   Tools panel takes a fraction of the vertical space it used to, leaving room for
+   Properties/Brushes to be visible without scrolling on a normal 900px-tall viewport. */
+.toolsPaintRow{display:grid;grid-template-columns:repeat(5,1fr);gap:3px;margin-bottom:2px}
+.toolPaintBtn{aspect-ratio:1;border:1px solid #5a6270;background:#454b56;border-radius:5px;color:#eaf0f8;
+  display:grid;place-items:center;padding:2px;position:relative;min-height:0}
+.toolPaintBtn svg{width:15px;height:15px;stroke:currentColor;fill:none;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
 .toolPaintBtn:hover{background:#525968}
 .toolPaintBtn.active{background:var(--accent2);border-color:var(--accent);color:#08131c}
-.toolPaintBtn .tpLabel{position:absolute;left:0;right:0;bottom:1px;font-size:7.5px;line-height:1.1;text-align:center;
-  color:inherit;opacity:.85;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding:0 2px}
-.toolSectionLabel{color:var(--text-dim);font-size:10px;text-transform:uppercase;letter-spacing:.08em;margin:9px 0 5px}
-.toolsActionGrid{display:grid;grid-template-columns:repeat(4,1fr);gap:4px}
-.toolActionBtn{aspect-ratio:1;border:1px solid #5a6270;background:#454b56;border-radius:6px;color:#eaf0f8;
-  display:grid;place-items:center;padding:4px}
-.toolActionBtn svg{width:17px;height:17px;stroke:currentColor;fill:none;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+.toolPaintBtn .tpLabel{display:none} /* name is shown via title tooltip instead — icons alone at this size */
+.toolSectionLabel{color:var(--text-dim);font-size:9px;text-transform:uppercase;letter-spacing:.08em;margin:5px 0 3px}
+.toolsActionGrid{display:grid;grid-template-columns:repeat(7,1fr);gap:3px}
+.toolActionBtn{aspect-ratio:1;border:1px solid #5a6270;background:#454b56;border-radius:4px;color:#eaf0f8;
+  display:grid;place-items:center;padding:2px;min-height:0}
+.toolActionBtn svg{width:13px;height:13px;stroke:currentColor;fill:none;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
 .toolActionBtn:hover{background:#525968}
 .toolActionBtn.active{background:var(--accent2);border-color:var(--accent2);color:#08131c}
 .toolActionBtn.isAction{border-style:dashed}
@@ -313,7 +317,6 @@ select{background:var(--input-bg);border:1px solid var(--line);color:var(--text)
         <div class="panelHead"><span class="dash" data-collapse></span><span class="ttl" id="brushesTitle">Brushes</span><button class="hbtn" data-menubtn="Brushes">≡</button></div>
         <div class="panelBody" id="brushesBody">
           <input id="brushSearch" class="search" placeholder="Search brushes">
-          <div class="bcActions"><label class="fileBtn">Import Brush Preset…<input type="file" accept=".json,application/json,.png,image/png" id="brushesPanelImportPreset"></label></div>
           <div class="catGrid" id="catGrid"></div>
           <div id="brushList"></div>
         </div>
@@ -694,7 +697,7 @@ let deckledEdgesOn=false; // organic torn-paper border, only meaningful for pape
 let toothMap=new Float32Array(N), absorbMap=new Float32Array(N);
 let paperR=new Float32Array(N), paperG=new Float32Array(N), paperB=new Float32Array(N);
 let layers=[], activeLayerIdx=0;
-let color='#c0417f', colorRGB=hexToRgb(color);
+let color='#000000', colorRGB=hexToRgb(color);
 let recentColors=[], favorites={};
 let currentTool='watercolor';
 let brush=null;
@@ -1590,108 +1593,28 @@ function findEmbeddedBrushJSON(chunks){
   return null;
 }
 /* =========================================================================
-   PNG BRUSH SHAPE ANALYSIS
-   Real Rebelle brushes differ from each other because their actual tip
-   shape, edge softness, and coverage density differ. A brush imported from
-   a bare shape-swatch PNG (no embedded metadata) needs those same real
-   differences derived from its OWN pixels — not a fixed 'round' shape with
-   fixed numbers, which is why two different swatches previously painted
-   identically. This walks the swatch's coverage mask and computes:
-     - aspect ratio & density of its bounding shape (round vs. elongated
-       vs. flat vs. sparse/scattered)
-     - fragment count via connected-component labeling (a tight single
-       blob vs. a scattered cluster of bristles/spatter/leaves)
-     - edge softness (hard-edged ink shape vs. soft feathered wash)
-     - local texture roughness (smooth vs. grainy coverage)
-   and maps those to one of the engine's existing footprint shapes
-   (round/mop/filbert/flat/liner/grunge/splat) plus real, differing
-   flow/water/grain/pigment/opacity/spacing values — so two different
-   brush PNGs come out as two genuinely different, independently-tunable
-   brushes, matching how Rebelle's own brush library behaves. */
-function analyzeBrushPngShape(ctx,w,h){
-  const id=ctx.getImageData(0,0,w,h).data;
-  let alphaVaries=false; const firstA=id[3];
-  for(let p=3;p<id.length;p+=4){ if(Math.abs(id[p]-firstA)>6){ alphaVaries=true; break; } }
-  const cov=new Float32Array(w*h);
-  for(let i=0,p=0;i<w*h;i++,p+=4){
-    const lum=(id[p]*0.299+id[p+1]*0.587+id[p+2]*0.114)/255;
-    const a=id[p+3]/255;
-    cov[i]=alphaVaries?a:(1-lum);
-  }
-  const ON=0.15;
-  let minx=w,maxx=-1,miny=h,maxy=-1,onCount=0,softCount=0,covSum=0;
-  for(let y=0;y<h;y++)for(let x=0;x<w;x++){
-    const v=cov[y*w+x];
-    if(v>ON){ onCount++; covSum+=v; if(x<minx)minx=x; if(x>maxx)maxx=x; if(y<miny)miny=y; if(y>maxy)maxy=y;
-      if(v>ON+0.03 && v<0.85) softCount++; }
-  }
-  if(onCount===0) return {shape:'round',aspect:1,density:.5,fragments:1,softFraction:.3,roughness:.2,coverageMean:.5};
-  const bw=Math.max(1,maxx-minx+1), bh=Math.max(1,maxy-miny+1);
-  const aspect=Math.max(bw,bh)/Math.max(1,Math.min(bw,bh));
-  const density=onCount/(bw*bh);
-  const softFraction=softCount/onCount;
-  const coverageMean=covSum/onCount;
-  // Connected-component count (4-neighbor flood fill) tells us "one solid tip" vs.
-  // "a scattered cluster of separate marks" (bristle spray, spatter, leaf clusters, etc.)
-  const visited=new Uint8Array(w*h);
-  let fragments=0;
-  const stack=[];
-  for(let y=miny;y<=maxy;y++)for(let x=minx;x<=maxx;x++){
-    const i=y*w+x;
-    if(visited[i]||cov[i]<=ON) continue;
-    fragments++;
-    stack.push(i);
-    while(stack.length){
-      const j=stack.pop(); if(visited[j]) continue; visited[j]=1;
-      if(cov[j]<=ON) continue;
-      const jx=j%w, jy=(j/w)|0;
-      if(jx>minx) stack.push(j-1); if(jx<maxx) stack.push(j+1);
-      if(jy>miny) stack.push(j-w); if(jy<maxy) stack.push(j+w);
-    }
-    if(fragments>60) break; // cap — beyond this it's simply "very scattered", no need to keep counting
-  }
-  // Local roughness: average abs difference between neighboring coverage samples inside
-  // the bounding box — a smooth soft blob scores low, a grainy/textured swatch scores high.
-  let roughSum=0,roughN=0;
-  for(let y=miny;y<maxy;y+=2)for(let x=minx;x<maxx;x+=2){
-    const i=y*w+x; if(cov[i]<=ON) continue;
-    roughSum+=Math.abs(cov[i]-cov[i+1])+Math.abs(cov[i]-cov[i+w]); roughN++;
-  }
-  const roughness=roughN?clamp((roughSum/roughN)*2.2,0,1):0.15;
-  let shape='round';
-  if(fragments>=5 && density<0.22) shape='splat';
-  else if(fragments>=3 && density<0.42) shape='grunge';
-  else if(aspect>=3.2) shape='liner';
-  else if(aspect>=1.9) shape='flat';
-  else if(aspect>=1.35) shape='filbert';
-  else if(density<0.5) shape='mop';
-  else shape='round';
-  return {shape,aspect,density,fragments,softFraction,roughness,coverageMean,bw,bh};
-}
-// Cheap deterministic hash of the coverage pixels so two visually-different swatches never
-// collapse onto identical numeric parameters even within the same shape category, while two
-// imports of the exact same file still get the exact same (reproducible) result.
-function hashCoverage(ctx,w,h){
-  const id=ctx.getImageData(0,0,w,h).data;
-  let h1=2166136261;
-  for(let i=0;i<id.length;i+=17){ h1=(h1^id[i])>>>0; h1=Math.imul(h1,16777619)>>>0; }
-  return (h1>>>0)/4294967295; // 0..1
-}
-function brushParamsFromPngAnalysis(a,seed,baseSize){
-  const j=(lo,hi)=>lo+(hi-lo)*seed; // deterministic per-image "jitter" inside a real range
-  const bySize={round:baseSize,mop:baseSize*1.5,filbert:baseSize*1.1,flat:baseSize*1.15,
-    liner:baseSize*0.55,grunge:baseSize*1.25,splat:baseSize*1.05}[a.shape]||baseSize;
-  const size=clamp(Math.round(bySize*j(0.85,1.2)),10,220);
-  const water=clamp(0.18+a.softFraction*0.55+j(-0.05,0.08),0.05,0.95);
-  const grain=clamp(a.roughness*0.75+j(0,0.12),0.03,0.95);
-  const pigment=clamp(0.1+a.coverageMean*0.7+j(-0.05,0.08),0.05,0.95);
-  const opacity=clamp(0.32+a.coverageMean*0.45+j(-0.06,0.08),0.15,0.92);
-  const flow=clamp(0.4+a.density*0.35+j(-0.05,0.1),0.15,0.95);
-  const blend={mop:0.5,filbert:0.36,round:0.3,flat:0.28,liner:0.2,grunge:0.16,splat:0.14}[a.shape]||0.3;
-  const spacing={liner:6,round:10,filbert:11,flat:12,mop:15,grunge:16,splat:18}[a.shape]||12;
-  return {shape:a.shape,size,maxSize:clamp(size*5,90,1500),opacity,flow,water,blend,
-    grain,pigment,loading:clamp(70+a.coverageMean*25,50,100),oiliness:clamp(40+a.density*35,20,95),spacing};
-}
+   PNG BRUSH IMPORT — HONEST LIMITS
+   Escape Motions confirms on their own support forum that Rebelle's brush
+   AND paper files are PNGs with the real settings packed into proprietary,
+   undocumented PNG metadata chunks — the visible pixels are only a preview
+   swatch (the little curved "swoosh" shown in the Brushes panel), not the
+   brush's actual tip/bristle shape. Escape Motions staff also confirm
+   third-party/foreign brushes can NEVER be fully imported into Rebelle —
+   not even their own official docs claim that; the documented workflow is
+   always "extract Shape & Grain and rebuild in Brush Creator" (see
+   https://www.escapemotions.com/community/forum/t/40496).
+   That means analyzing the PNG's pixels (what the previous version of this
+   importer did) is fundamentally the wrong approach for a metadata-less
+   file: every Rebelle preview swoosh looks like a similar curved stroke
+   regardless of the real brush behind it, which is exactly why three
+   different brush files all produced near-identical results.
+   The honest fix: fall back to the SAME filename-keyword heuristic that
+   already successfully differentiates this app's ~90 built-in brushes
+   (synthBrush()) — "leaf/mop/wash" reads as a soft wide glaze, "liner/rigger"
+   reads as a thin hard line, "grunge/splat" reads as scattered/textured, an
+   unrecognized name falls back to a neutral round brush — and tell the user
+   plainly that fine-tuning in Brush Creator is expected, instead of
+   pretending pixel-guessing produced Rebelle-accurate values. */
 async function importBrushPresetFromPng(file){
   try{
     const buf=await file.arrayBuffer();
@@ -1708,31 +1631,28 @@ async function importBrushPresetFromPng(file){
       b=await deserializeBrush(Object.assign({},meta,{shapeTexture:meta.shapeTexture||dataURL}));
       setStatus('Imported "'+b.name+'" from PNG brush file — original dynamics restored');
     } else {
-      // No metadata: analyze the swatch's own pixels — shape, density, softness, roughness —
-      // and derive REAL, differing dynamics from that analysis (not a fixed 'round' default),
-      // so each imported brush actually paints differently, the way distinct Rebelle brushes do.
+      // No embedded metadata (the normal case — see comment above): use the SAME
+      // filename-keyword logic as the built-in brush library, so the name you gave the
+      // file/brush actually drives real, differing dynamics instead of every unlabeled
+      // swatch collapsing onto the same guessed shape.
       const targetTool=(TOOLS_BY_ID[currentTool] && TOOLS_BY_ID[currentTool].kind==='paint') ? currentTool : 'watercolor';
-      const analysisCanvas=imageToCanvas(img,96);
-      const analysis=analyzeBrushPngShape(analysisCanvas.ctx,analysisCanvas.w,analysisCanvas.h);
-      const seed=hashCoverage(analysisCanvas.ctx,analysisCanvas.w,analysisCanvas.h);
-      const baseSizeByTool={oil:60,expressoil:60,watercolor:48,ink:36,pencil:16,pastel:44,marker:34,airbrush:66}[targetTool]||48;
-      const params=brushParamsFromPngAnalysis(analysis,seed,baseSizeByTool);
-      const shapeTex=extractCoverageTexture(g,w,h,false);
-      const niceName=file.name.replace(/\.[a-z0-9]+$/i,'').replace(/[_-]+/g,' ').trim()||'Imported Brush';
-      const key='custom_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,7);
       const engineForTool={oil:'oil',expressoil:'expressoil',watercolor:'watercolor',ink:'ink',pencil:'dryMedia',pastel:'dryMedia',marker:'marker',airbrush:'airbrush'}[targetTool]||'watercolor';
-      b={name:niceName,group:'My Brushes',tool:targetTool,engine:engineForTool,
-        shape:params.shape,size:params.size,maxSize:params.maxSize,opacity:params.opacity,flow:params.flow,
-        water:params.water,blend:params.blend,grain:params.grain,pigment:params.pigment,
-        loading:params.loading,oiliness:params.oiliness,spacing:params.spacing,tolerance:20,
-        key,shapeTex,shapeTexURL:dataURL,shapeInvert:false,
+      const baseSizeByTool={oil:60,expressoil:60,watercolor:48,ink:36,pencil:16,pastel:44,marker:34,airbrush:66}[targetTool]||48;
+      const niceName=file.name.replace(/\.[a-z0-9]+$/i,'').replace(/[_-]+/g,' ').trim()||'Imported Brush';
+      // synthBrush() infers shape from a defaultShape hint + name keywords; we don't know
+      // the real tip shape, so start from 'round' (Rebelle's most common base tip) and let
+      // keyword matches (liner, mop, splat, grunge, thick, soft, hard, etc.) do the real work.
+      const params=synthBrush(niceName,'round',baseSizeByTool,targetTool,engineForTool,'My Brushes');
+      const shapeTex=extractCoverageTexture(g,w,h,false);
+      const key='custom_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,7);
+      b=Object.assign(params,{key,maxSize:clamp(params.size*5,90,1500),
+        shapeTex,shapeTexURL:dataURL,shapeInvert:false,
         sizeBehavior:'pressure',opacityBehavior:'pressure-soft',tipTilt:0,brushForm:0,smudgeOnStroke:false,
         jitter:{enabled:false,mode:'stamp',hue:0,sat:0,bright:0},imported:true,importedFromPng:true,
-        pngAnalysis:{shape:analysis.shape,aspect:+analysis.aspect.toFixed(2),density:+analysis.density.toFixed(2),
-          fragments:analysis.fragments,roughness:+analysis.roughness.toFixed(2)}};
-      setStatus('Imported "'+b.name+'" from PNG — detected shape "'+analysis.shape+'" (aspect '+analysis.aspect.toFixed(1)+
-        ', density '+Math.round(analysis.density*100)+'%, '+analysis.fragments+' fragment'+(analysis.fragments>1?'s':'')+
-        ') → size '+params.size+'px, water '+params.water.toFixed(2)+', grain '+params.grain.toFixed(2));
+        needsShapeReview:true});
+      setStatus('Imported "'+b.name+'" — Rebelle .png brushes store their real shape data in an '+
+        'undocumented format we cannot read, so dynamics were guessed from the file name ("'+niceName+
+        '"). Open Brush Creator → Shape & Grain to fine-tune it to match the original.');
     }
     finishBrushPresetImport([b],b.tool,true);
   }catch(e){
@@ -3657,7 +3577,7 @@ function renderBrushList(set,groupNames){
       el.draggable=isReorderable;
       el.dataset.brushKey=b.key; el.dataset.brushGroup=g;
       el.innerHTML=`<svg class="swoosh" viewBox="0 0 40 16"><path d="M2 13 C 10 3, 16 15, 22 7 S 34 3, 38 10" fill="none" stroke="#cfe6f7" stroke-width="${clamp(b.size/14,1,6)}" stroke-linecap="round" opacity="${clamp(b.opacity+0.2,0.2,1)}"/></svg>
-        <div><div class="bi-name">${b.name}</div><div class="bi-sub">${b.shape} · water ${b.water.toFixed(2)}</div></div>
+        <div><div class="bi-name">${b.name}${b.needsShapeReview?' <span class="tinyNote" style="color:#f2b400" title="Imported from a Rebelle .png with no readable shape data — dynamics were guessed from the file name. Open Brush Creator to fine-tune.">⚠ review shape</span>':''}</div><div class="bi-sub">${b.shape} · water ${b.water.toFixed(2)}</div></div>
         ${b.imported?`<button class="star" data-remove="${b.key}" title="Remove from My Brushes">✕</button>`:''}
         <button class="star ${favorites[b.key]?'on':''}" data-fav="${b.key}">★</button>`;
       el.addEventListener('click',(e)=>{
@@ -4383,7 +4303,7 @@ function buildColorPanel(){
 /* ---- My Colors (PRO: Smarter Asset Management for the color library) ----
    A user-managed color palette supporting multi-select (Ctrl/Shift-click), drag-and-drop
    reordering, and single-swatch removal — persisted the same way as My Brushes/My Papers. */
-let myColors=['#c0417f','#2c5fe0','#159a55','#e2402f','#f2b400','#101010','#7a4d2c','#00a6c8','#7c3dff','#ffffff','#f97316','#5b6b12','#8fd3ff','#ffd166','#d1495b','#06d6a0'];
+let myColors=['#000000','#c0417f','#2c5fe0','#159a55','#e2402f','#f2b400','#101010','#7a4d2c','#00a6c8','#7c3dff','#ffffff','#f97316','#5b6b12','#8fd3ff','#ffd166','#d1495b','#06d6a0'];
 let selectedSwatchKeys=new Set();
 let lastClickedSwatch=null;
 async function persistMyColors(){ if(!HAS_STORAGE) return; await storageSet('my-colors',JSON.stringify(myColors),false); }
@@ -5822,6 +5742,9 @@ function buildQuickbar(){
     <button class="qbtn" id="qbDry">Dry Canvas</button>
     <button class="qbtn" id="qbClear">Clear Layer</button>
     <div class="qsep"></div>
+    <label class="qbtn fileBtn" style="padding:5px 10px" title="Import a Rebelle brush preset (.json or .png)">Import Brush…<input type="file" accept=".json,application/json,.png,image/png" id="qbImportBrush"></label>
+    <label class="qbtn fileBtn" style="padding:5px 10px" title="Import a custom paper/canvas texture (.png/.jpg)">Import Paper…<input type="file" accept="image/*" id="qbImportPaper"></label>
+    <div class="qsep"></div>
     <button class="qbtn primary" id="qbExport">Export PNG</button>`;
   document.getElementById('qbColor').oninput=e=>setColor(e.target.value);
   document.getElementById('qbUndo').onclick=undo;
@@ -5829,6 +5752,11 @@ function buildQuickbar(){
   document.getElementById('qbDry').onclick=dryCanvas;
   document.getElementById('qbClear').onclick=clearActiveLayer;
   document.getElementById('qbExport').onclick=exportPNG;
+  // Same underlying importers as the Brushes/Layer Settings panels — this is just a second,
+  // always-visible entry point for the two most-requested import actions, living in the
+  // otherwise-empty space below the menu bar instead of being buried in a side panel.
+  const qib=document.getElementById('qbImportBrush'); if(qib) qib.onchange=e=>{ if(e.target.files[0]) importBrushPresetFile(e.target.files[0]); };
+  const qip=document.getElementById('qbImportPaper'); if(qip) qip.onchange=e=>{ if(e.target.files[0]) importPaperFile(e.target.files[0]); };
   updateUndoRedoUI();
 }
 function updateQuickbar(){
@@ -5877,7 +5805,8 @@ function init(){
   fitCanvas();
   dirty=true; render(true);
   requestAnimationFrame(animate);
-  const bpi=document.getElementById('brushesPanelImportPreset'); if(bpi) bpi.onchange=e=>{ if(e.target.files[0]) importBrushPresetFile(e.target.files[0]); };
+  // Import Brush Preset now lives in the quickbar (see buildQuickbar) instead of the
+  // Brushes panel, to reduce left-panel clutter; drag-and-drop onto Brush Creator still works.
   wireDropImport('bcBody','brushcreator');
   wireDropImport('layerSettingsBody','paper');
   // Load any previously imported personal brushes/papers/preferences (persists across reloads in this environment)
