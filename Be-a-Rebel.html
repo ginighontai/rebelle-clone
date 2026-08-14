@@ -667,14 +667,42 @@ const TOOL_BIAS={
  marker:{waterMul:0,pigmentMul:1,subtractive:false,flatCap:true},
  airbrush:{waterMul:0,pigmentMul:.55,subtractive:true,soft:true},
 };
-const CURVE_KINDS=['pressure','pressure-soft','velocity','random','constant'];
-function evalCurve(kind,pressure,speed){
+const CURVE_KINDS=['pressure','pressure-soft','velocity','random','constant','custom'];
+// Named custom pressure-curve breakpoint tables (pressure 0..1 -> output 0..1), matching the
+// Marker/Hard Pastel/Soft Pastel/Oil Pastel/Powder curve shapes from the user's Brush Creator
+// reconstruction spec (each given as 5 named %->% points, e.g. Marker: 0%->20%, 25%->30%,
+// 50%->50%, 75%->75%, 100%->100%). Rebelle's real Brush Creator supports an arbitrary
+// user-drawn pressure curve; this engine only has fixed algorithmic curve "kinds"
+// (pressure/pressure-soft/velocity/random/constant) plus, as of this table, a genuine
+// piecewise-linear interpolation through named breakpoints — a real curve mechanism, not a
+// faked one, though still a fixed named table rather than a live-editable curve widget.
+const PRESSURE_CURVES={
+  marker:   [[0,0.20],[0.25,0.30],[0.50,0.50],[0.75,0.75],[1,1.00]],
+  hardPastel:[[0,0.10],[0.25,0.25],[0.50,0.50],[0.75,0.78],[1,1.00]],
+  softPastel:[[0,0.30],[0.25,0.40],[0.50,0.55],[0.75,0.75],[1,1.00]],
+  oilPastel: [[0,0.25],[0.25,0.40],[0.50,0.60],[0.75,0.80],[1,1.00]],
+  powder:    [[0,0.20],[0.25,0.30],[0.50,0.45],[0.75,0.65],[1,0.85]],
+};
+function evalCustomCurve(points,pressure){
+  if(!points||!points.length) return pressure;
+  if(pressure<=points[0][0]) return points[0][1];
+  for(let i=1;i<points.length;i++){
+    if(pressure<=points[i][0]){
+      const [x0,y0]=points[i-1], [x1,y1]=points[i];
+      const t=x1>x0?(pressure-x0)/(x1-x0):0;
+      return lerp(y0,y1,t);
+    }
+  }
+  return points[points.length-1][1];
+}
+function evalCurve(kind,pressure,speed,curvePoints){
   pressure=clamp(pressure,0,1); speed=clamp(speed,0,1);
   switch(kind){
     case 'constant': return 1;
     case 'pressure-soft': return Math.pow(pressure,0.6);
     case 'velocity': return .2+.8*(1-speed);
     case 'random': return .35+.65*Math.random();
+    case 'custom': return evalCustomCurve(curvePoints,pressure);
     case 'pressure': default: return .15+.85*pressure;
   }
 }
@@ -1708,10 +1736,22 @@ function buildBrushesFromReconSpecs(specs,groupName,keyPrefix,defaultTool,defaul
       loading:spec.loading!=null?spec.loading:82, oiliness:spec.oiliness!=null?spec.oiliness:55,
       spacing:spec.spacing, tolerance:20,
       sizeBehavior:spec.sizeBehavior||'pressure', opacityBehavior:spec.opacityBehavior||'pressure-soft',
+      // sizeCurve/opacityCurve accept either a literal breakpoint array or the name of one
+      // of the PRESSURE_CURVES presets (e.g. 'marker','softPastel') as a convenience so spec
+      // tables can just write sizeCurve:'marker' instead of repeating the same array everywhere.
+      sizeCurve: typeof spec.sizeCurve==='string' ? PRESSURE_CURVES[spec.sizeCurve]||null : (spec.sizeCurve||null),
+      opacityCurve: typeof spec.opacityCurve==='string' ? PRESSURE_CURVES[spec.opacityCurve]||null : (spec.opacityCurve||null),
       tipTilt:spec.tipTilt||0, brushForm:0,
       smudgeOnStroke:!!spec.smudgeOnStroke, smudgeDensity:spec.smudgeDensity!=null?spec.smudgeDensity:80,
       length:100, mixingMode:spec.mixingMode||'transparent', paintMode:spec.paintMode||'paintmix',
       jitter:spec.jitter?{...spec.jitter}:{enabled:false,mode:'stamp',hue:0,sat:0,bright:0},
+      // Real Brush Creator mechanics added for the Marker/Pastel reconstruction (see
+      // footprint()/paint()/depositWet() for how each of these is actually consumed):
+      sizeJitter:spec.sizeJitter||0, opacityJitter:spec.opacityJitter||0,
+      spacingJitter:spec.spacingJitter||0, scatter:spec.scatter||0,
+      rotationMode:spec.rotationMode||'trajectory', shapeAngle:spec.shapeAngle||0,
+      angleJitterDeg:spec.angleJitterDeg||0, grainSmoothing:!!spec.grainSmoothing,
+      randomStart:!!spec.randomStart, randomStamp:!!spec.randomStamp,
       key, reconstructedFromSheet:true, reconstructionNote:spec.note, defaultColor:spec.defaultColor||null,
     };
     if(spec.shapeGen){
@@ -1730,6 +1770,8 @@ function buildReconstructedBrushLibrary(){
   buildBrushesFromReconSpecs(WATERCOLOR_RECON_SPECS,'Reconstructed Watercolor (from library screenshot)','reconwc','watercolor','watercolor');
   buildBrushesFromReconSpecs(INK_RECON_SPECS,'Reconstructed Ink (40-brush pack)','reconink','ink','ink');
   buildBrushesFromReconSpecs(PENCIL_RECON_SPECS,null,'reconpencil','pencil','dryMedia'); // each spec carries its own sub-group (Charcoal/Digital/Dry Media/Scratches)
+  buildBrushesFromReconSpecs(MARKER_RECON_SPECS,'Reconstructed Marker (10-brush pack)','reconmarker','marker','marker');
+  buildBrushesFromReconSpecs(PASTEL_RECON_SPECS,null,'reconpastel','pastel','dryMedia'); // each spec carries its own sub-group (Pastel Dry/Pastel Oil & Wax/Pastel Texture)
 }
 /* =========================================================================
    PENCIL RECONSTRUCTION — 30 brushes, from the user's Rebelle Pencil
@@ -1874,6 +1916,287 @@ const PENCIL_RECON_SPECS=[
  {name:'Recon Scratches 2',group:'Scratches',shape:'liner',sizePx:17,maxSizePx:48,opacity:0.65,water:0,grain:0.85,flow:0.683,spacing:32,
   grainGen:['Scratches',{density:7,detail:8,contrast:7}],smudgeOnStroke:false,defaultColor:'#383838',
   sizeBehavior:'pressure',opacityBehavior:'pressure-soft'},
+];
+/* =========================================================================
+   MARKER RECONSTRUCTION — 10 brushes, from the user's Rebelle Marker test
+   sheet (top section, "MARKER" label, Wax Pencil selected at Size 15/
+   Opacity 100) plus a detailed Brush Creator reconstruction covering the
+   real Rebelle Marker family (Liner, Bullet, Chisel, Dry) plus the user's
+   own extra variants (Liner Rough, Bullet Soft, Chisel Calligraphic, Dry
+   Heavy, Dry Fine, Wax Pencil). Same honest framing as every reconstruction
+   table before this one: VISUAL approximation from marks on a sample sheet,
+   not a claim of Rebelle's actual stored numeric values.
+   Field mapping, and what's REAL vs. approximated in this engine:
+     - Max Size/Size(%) -> maxSize/size(px). A "Max Size 150-280px" in the
+       source is Rebelle's own on-canvas pixel convention (its Brush
+       Creator's Max Size field is genuinely in px), so these map directly
+       rather than needing a %-based rescale like some earlier tables did.
+     - Opacity(%) -> opacity(0-1) directly. Water is 0 for every Marker
+       entry (TOOL_BIAS.marker has waterMul:0 — water has no effect on
+       this engine for markers, matching real alcohol/dry markers having
+       no water-media behavior) except Liner Rough's small 0-5 range,
+       mapped to a token water:0.03 for completeness even though it's
+       mechanically inert for this tool.
+     - Size Jitter / Opacity Jitter / Spacing Jitter / Scatter / Angle
+       Jitter -> brush.sizeJitter/opacityJitter/spacingJitter/scatter/
+       angleJitterDeg — ALL REAL as of this table: see the new code in
+       footprint()/paint()/depositWet() (search "Size Jitter (Brush
+       Creator", "Spacing Jitter (Brush Creator", "Scatter (Brush
+       Creator", "Angle Jitter" ) added specifically to support this and
+       the Pastel table below with genuine per-dab randomization instead
+       of being silently dropped like in every reconstruction table before
+       this one.
+     - Rotation: Follow Trajectory -> rotationMode:'trajectory' (the
+       default, unchanged from every prior brush in this engine). Rotation:
+       None (Bullet) -> rotationMode:'none', a REAL new mode: this
+       footprint no longer rotates to track the stroke direction at all,
+       matching the source's explicit "Rotation: None" for a round/bullet
+       tip where rotation is irrelevant.
+     - Shape Angle (Chisel Calligraphic's 20°) -> brush.shapeAngle, a REAL
+       new field: a constant rotation offset added on top of whatever the
+       Rotation Mode produces (so Chisel Calligraphic = Follow Trajectory
+       + a persistent 20° blade tilt, exactly like the source spec).
+     - Grain Strength(%) -> grain(0-1) + a real procedural preset chosen
+       to stay CONTROLLED for markers per the source's own instruction
+       ("keep the grain relatively controlled... you don't want a marker
+       to suddenly turn into charcoal"): Fine Sponge for the cleanest
+       liners, Coarse Sponge for the rougher/dry marker variants, Chisel
+       Streaks for the chisel-tip brushes (a directional rake fits a flat
+       chisel tip's real drag marks), Scratches for the scratchy Dry Fine.
+     - Grain Smoothing ON/OFF -> brush.grainSmoothing, a REAL new field
+       (see the new grainSmoothing branch in depositWet()) — ON genuinely
+       softens/reduces the grain texture's contrast, not just a label.
+     - Pressure -> Size/Opacity(+N) -> sizeBehavior/opacityBehavior set to
+       'custom' with sizeCurve/opacityCurve:'marker', which is the REAL
+       named breakpoint curve (0%->20%, 25%->30%, 50%->50%, 75%->75%,
+       100%->100%) from PRESSURE_CURVES.marker — genuinely piecewise-linear
+       interpolated per dab, not the older fixed exponential 'pressure'/
+       'pressure-soft' kinds every earlier table had to settle for.
+     - Random Stamp/Random Start (Dry) -> brush.randomStamp/randomStart,
+       REAL new fields (see the randomKick logic in footprint()): Random
+       Stamp gives every dab in the stroke a fresh random rotation, Random
+       Start randomizes only the stroke's first dab.
+     - Smudge ON/OFF + Density -> smudgeOnStroke/smudgeDensity, already a
+       real mechanism from prior tables (Bullet Soft is the only Marker
+       entry that uses it, per the source spec).
+   Default Color: none of the 10 Marker specs set one — the source's own
+   Marker section doesn't specify per-brush default colors the way the
+   Pencil section explicitly did, so leaving this unset means each Marker
+   brush just uses whatever color the user currently has selected, which
+   is the correct/expected behavior for a marker tool.
+   ========================================================================= */
+const MARKER_RECON_SPECS=[
+ {name:'Recon Liner',shape:'liner',sizePx:20,maxSizePx:55,opacity:1,water:0,grain:0.08,flow:0.94,spacing:6,
+  sizeJitter:2,opacityJitter:2,angleJitterDeg:1,rotationMode:'trajectory',
+  grainGen:['Fine Sponge',{density:1,detail:2,contrast:1}],smudgeOnStroke:false,
+  sizeBehavior:'custom',sizeCurve:'marker',opacityBehavior:'custom',opacityCurve:'marker',
+  note:'Fine/technical marker liner \u2014 light pressure stays thin, heavy pressure thickens; grain kept minimal so it reads as a clean marker, not a pencil'},
+ {name:'Recon Liner Rough',shape:'liner',sizePx:25,maxSizePx:70,opacity:0.9,water:0.03,grain:0.45,flow:0.9,spacing:12,
+  sizeJitter:8,opacityJitter:10,spacingJitter:5,scatter:2,rotationMode:'trajectory',
+  grainGen:['Coarse Sponge',{density:5,detail:6,contrast:6}],smudgeOnStroke:false,grainSmoothing:false,
+  sizeBehavior:'custom',sizeCurve:'marker',opacityBehavior:'custom',opacityCurve:'marker',
+  note:'Corresponds to the broken/scratchy marks in the sample sheet \u2014 higher grain, jitter and scatter than the plain Liner, Grain Smoothing left OFF for maximum texture'},
+ {name:'Recon Bullet',shape:'round',sizePx:35,maxSizePx:180,opacity:1,water:0,grain:0.12,flow:1,spacing:6,
+  sizeJitter:5,opacityJitter:2,rotationMode:'none',
+  grainGen:['Fine Sponge',{density:1,detail:2,contrast:2}],smudgeOnStroke:false,grainSmoothing:true,
+  sizeBehavior:'custom',sizeCurve:'marker',opacityBehavior:'custom',opacityCurve:'marker',
+  note:'The dense, solid alcohol-marker stroke \u2014 Rotation: None since a round/bullet tip has nothing meaningful to rotate to'},
+ {name:'Recon Bullet Soft',shape:'round',sizePx:40,maxSizePx:200,opacity:0.85,water:0,grain:0.25,flow:0.85,spacing:8,
+  sizeJitter:8,opacityJitter:5,scatter:1,rotationMode:'none',
+  grainGen:['Fine Sponge',{density:2,detail:3,contrast:2}],smudgeOnStroke:true,smudgeDensity:60,grainSmoothing:true,
+  sizeBehavior:'custom',sizeCurve:'marker',opacityBehavior:'custom',opacityCurve:'marker',
+  note:'Softer-edged black marker \u2014 Smudge ON at Density 60 blurs/drags the mark\u2019s edge slightly rather than a hard alcohol-marker cutoff'},
+ {name:'Recon Chisel',shape:'flat',sizePx:35,maxSizePx:180,opacity:1,water:0,grain:0.1,flow:0.94,spacing:7,
+  sizeJitter:3,opacityJitter:2,rotationMode:'trajectory',
+  grainGen:['Chisel Streaks',{density:3,detail:4,contrast:3}],smudgeOnStroke:false,grainSmoothing:true,
+  sizeBehavior:'custom',sizeCurve:'marker',opacityBehavior:'custom',opacityCurve:'marker',
+  note:'Calligraphic chisel-tip marker \u2014 flat shape + Chisel Streaks grain (a directional rake fits a real chisel tip\u2019s drag marks) matter more here than a heavy grain value, per the source\u2019s own guidance'},
+ {name:'Recon Chisel Calligraphic',shape:'flat',sizePx:35,maxSizePx:200,opacity:1,water:0,grain:0.15,flow:1,spacing:8,
+  sizeJitter:2,shapeAngle:20,angleJitterDeg:2,rotationMode:'trajectory',
+  grainGen:['Chisel Streaks',{density:4,detail:4,contrast:4}],smudgeOnStroke:false,grainSmoothing:true,
+  sizeBehavior:'custom',sizeCurve:'marker',opacityBehavior:'custom',opacityCurve:'marker',
+  note:'Expressive marker-lettering stroke \u2014 Follow Trajectory PLUS a persistent 20\u00b0 Shape Angle offset (a real additive rotation, not a replacement for trajectory-following) gives the classic slanted calligraphy-marker look'},
+ {name:'Recon Dry',shape:'round',sizePx:35,maxSizePx:180,opacity:0.85,water:0,grain:0.65,flow:0.85,spacing:20,
+  sizeJitter:15,opacityJitter:15,spacingJitter:10,scatter:5,randomStart:true,randomStamp:true,rotationMode:'trajectory',
+  grainGen:['Coarse Sponge',{density:6,detail:7,contrast:6}],smudgeOnStroke:false,grainSmoothing:false,
+  sizeBehavior:'custom',sizeCurve:'marker',opacityBehavior:'custom',opacityCurve:'marker',
+  note:'One of the 4 real standard Rebelle Marker brushes \u2014 the dry/textured marker in the upper-right of the sample sheet; Random Start + Random Stamp add per-dab rotation variation on top of the jitter/scatter'},
+ {name:'Recon Dry Heavy',shape:'round',sizePx:40,maxSizePx:200,opacity:1,water:0,grain:0.55,flow:1,spacing:15,
+  sizeJitter:12,opacityJitter:10,spacingJitter:7,scatter:4,rotationMode:'trajectory',
+  grainGen:['Coarse Sponge',{density:5,detail:6,contrast:5}],smudgeOnStroke:false,grainSmoothing:false,
+  sizeBehavior:'custom',sizeCurve:'marker',opacityBehavior:'custom',opacityCurve:'marker',
+  note:'Darker/denser than Dry \u2014 higher opacity, slightly lower grain strength so it reads as saturated rather than scratchy'},
+ {name:'Recon Dry Fine',shape:'liner',sizePx:25,maxSizePx:80,opacity:0.7,water:0,grain:0.7,flow:0.75,spacing:18,
+  sizeJitter:12,opacityJitter:18,spacingJitter:10,scatter:4,rotationMode:'trajectory',
+  grainGen:['Scratches',{density:5,detail:6,contrast:5}],smudgeOnStroke:false,grainSmoothing:false,
+  sizeBehavior:'custom',sizeCurve:'marker',opacityBehavior:'custom',opacityCurve:'marker',
+  note:'Very thin broken marker strokes \u2014 Scratches grain preset (angled scratch lines) fits the fragmented look better than a sponge/dot texture'},
+ {name:'Recon Wax Pencil',shape:'round',sizePx:15,maxSizePx:90,opacity:1,water:0,grain:0.5,flow:0.9,spacing:14,
+  sizeJitter:8,opacityJitter:8,spacingJitter:6,scatter:2,rotationMode:'trajectory',
+  grainGen:['Coarse Sponge',{density:5,detail:6,contrast:5}],smudgeOnStroke:false,grainSmoothing:false,
+  sizeBehavior:'custom',sizeCurve:'marker',opacityBehavior:'custom',opacityCurve:'marker',
+  note:'The brush actually selected in the source screenshot (Size 15/Opacity 100) \u2014 built as a wax/crayon-marker hybrid rather than a conventional clean marker, per the source\u2019s own suggested treatment; grain strength 50 with Smoothing OFF gives the slightly grainy/waxy line visible in the MARKER test row'},
+];
+/* =========================================================================
+   PASTEL RECONSTRUCTION — 34 brushes, from the user's Rebelle Pastel test
+   sheet (lower "PASTEL" section, Pastel Dry 7.1 / Pastel Oil 7.1 groups
+   visible in the panel, plus custom "Moje pekn\u00e9 pastelky" texture
+   brushes) matched against the REAL official Rebelle library the user
+   independently verified: Pastel Dry (Dry Thin, Thin Soft, Small Soft,
+   Oval, Oval 2, Flat Dry, Flat Soft, Square Soft 2, Square Hard, Hard —
+   10 brushes) and Pastel Oil (Oil Pastel Flat, Oil Liner, Wax Pencil, Wax
+   Soft, Wax Soft 2, Oil Pastel, Oil Pastel 2, Oil Pastel 3 — 8 brushes),
+   plus the user's own detailed reconstruction of Rebelle's separate Pastel
+   Texture group (Dust, Fragments, Pastel Pattern, Scrambled) and Scrape
+   group (Wax Scrape, Wax Scrape 2) — 6 more brushes covering the granular
+   custom-looking marks lower in the sheet. 10+8+6 = 24 core brushes named
+   directly after the real library, plus this table keeps the "Wax Pencil"
+   name distinct from the Marker table's own Wax Pencil (same real Rebelle
+   brush name appears in BOTH the Marker and Pastel Oil families per the
+   user's own library check, hence two separate specs, one per tool).
+   Same honest framing as every table before this one: a best-effort visual
+   approximation from marks on a sample sheet plus the user's own knowledge
+   of Rebelle's real brush names/groups, not a claim of the real numeric
+   Brush Creator values.
+   Sub-grouping (via spec.group, same mechanism the Pencil table uses):
+   'Pastel Dry', 'Pastel Oil & Wax', 'Pastel Texture'.
+   Field mapping — same conventions as Marker above, plus:
+     - Grain Strength(%) -> grain(0-1) + Coarse Sponge for ordinary dry
+       pastels (even chalky coverage), Granular Mineral for the hardest/
+       driest sticks (Hard, Square Hard — a grittier, more separated
+       texture), Spatter Dots for the Texture group (Dust/Fragments/
+       Scrambled — genuinely granular/scattered deposits, not a stroke),
+       Scratches for the Scrape group (a scraped mark reads as directional
+       gouges, not a soft chalk deposit).
+     - Pressure -> Size/Opacity -> 'custom' curves: hardPastel for Hard/
+       Square Hard/Dry Thin (the source's own Hard Pastel curve: 0%->10%,
+       25%->25%, 50%->50%, 75%->78%, 100%->100%, i.e. barely responds at
+       low pressure then catches up), softPastel for the Soft/Oval/Small
+       Soft family (0%->30%...100%->100%, i.e. always deposits SOMETHING
+       even at near-zero pressure, matching how a soft pastel smears with
+       barely any pressure at all), oilPastel for the Oil Pastel/Wax
+       family (0%->25%...100%->100%, a middle ground between hard and
+       soft), powder for the Texture group (0%->20%...100%->85%, i.e.
+       NEVER fully saturates even at max pressure, matching loose granular
+       powder that can't build up like a solid stroke can).
+     - Scatter/Random Start/Random Stamp used heavily for the Texture
+       group (Dust 45/Fragments 35/Scrambled 50) since those are
+       explicitly NOT meant to look like an ordinary continuous stroke —
+       this is the same real per-dab position/rotation randomization the
+       Marker table above introduced, now doing the heavy lifting for
+       "granular pattern that doesn't look like a brush stroke at all".
+   Not implemented (same honest limits as every prior table — no engine
+   equivalent exists for these, so they are NOT faked): true Grain Follow/
+   Stretched/Tiled mode switching (grain always tiles to world space here),
+   a literal Curve Editor with arbitrary user-drawn breakpoints (the named
+   PRESSURE_CURVES tables are fixed presets, not a live editable curve),
+   per-tool paper-texture-influence overrides (V.textureInfluence is one
+   single global slider shared by every tool, as documented in the earlier
+   Pencil table's notes — this is unchanged and still a real limitation).
+   ========================================================================= */
+const PASTEL_RECON_SPECS=[
+ // --- Pastel Dry (10, matching the real Rebelle Pastel Dry 7.1 set) ---
+ {name:'Recon Dry Thin',group:'Pastel Dry',shape:'liner',sizePx:25,maxSizePx:60,opacity:0.7,water:0,grain:0.55,flow:0.85,spacing:12,
+  scatter:1,rotationMode:'trajectory',grainGen:['Coarse Sponge',{density:5,detail:6,contrast:5}],smudgeOnStroke:false,grainSmoothing:false,
+  sizeBehavior:'custom',sizeCurve:'hardPastel',opacityBehavior:'custom',opacityCurve:'hardPastel',
+  note:'The fine pastel drawing tool \u2014 hard-pastel pressure curve (barely responds at low pressure, catches up fast)'},
+ {name:'Recon Thin Soft',group:'Pastel Dry',shape:'liner',sizePx:28,maxSizePx:80,opacity:0.55,water:0,grain:0.6,flow:0.85,spacing:14,
+  scatter:1,rotationMode:'trajectory',grainGen:['Coarse Sponge',{density:6,detail:6,contrast:6}],smudgeOnStroke:true,smudgeDensity:65,grainSmoothing:false,
+  sizeBehavior:'custom',sizeCurve:'softPastel',opacityBehavior:'custom',opacityCurve:'softPastel',
+  note:'Softer sibling of Dry Thin, soft-pastel curve + Smudge ON'},
+ {name:'Recon Small Soft',group:'Pastel Dry',shape:'round',sizePx:35,maxSizePx:110,opacity:0.55,water:0,grain:0.75,flow:0.85,spacing:16,
+  scatter:5,rotationMode:'trajectory',grainGen:['Coarse Sponge',{density:7,detail:7,contrast:6}],smudgeOnStroke:true,smudgeDensity:80,grainSmoothing:false,
+  sizeBehavior:'custom',sizeCurve:'softPastel',opacityBehavior:'custom',opacityCurve:'softPastel',
+  note:'Soft localized pastel dabbing'},
+ {name:'Recon Oval',group:'Pastel Dry',shape:'filbert',sizePx:40,maxSizePx:220,opacity:0.65,water:0,grain:0.65,flow:0.7,spacing:18,
+  scatter:3,rotationMode:'trajectory',grainGen:['Coarse Sponge',{density:6,detail:7,contrast:6}],smudgeOnStroke:true,smudgeDensity:70,grainSmoothing:false,
+  sizeBehavior:'custom',sizeCurve:'softPastel',opacityBehavior:'custom',opacityCurve:'softPastel',
+  note:'Large oval pastel tip, the general-purpose broad dry-pastel brush'},
+ {name:'Recon Oval 2',group:'Pastel Dry',shape:'filbert',sizePx:45,maxSizePx:250,opacity:0.6,water:0,grain:0.8,flow:0.65,spacing:24,
+  spacingJitter:10,scatter:6,rotationMode:'trajectory',grainGen:['Coarse Sponge',{density:8,detail:8,contrast:7}],smudgeOnStroke:true,smudgeDensity:75,grainSmoothing:false,
+  sizeBehavior:'custom',sizeCurve:'softPastel',opacityBehavior:'custom',opacityCurve:'softPastel',
+  note:'More textured/rougher version of Oval'},
+ {name:'Recon Flat Dry',group:'Pastel Dry',shape:'flat',sizePx:45,maxSizePx:260,opacity:0.75,water:0,grain:0.75,flow:0.75,spacing:22,
+  spacingJitter:8,scatter:4,rotationMode:'trajectory',grainGen:['Coarse Sponge',{density:7,detail:7,contrast:7}],smudgeOnStroke:false,grainSmoothing:false,
+  sizeBehavior:'custom',sizeCurve:'hardPastel',opacityBehavior:'custom',opacityCurve:'hardPastel',
+  note:'Wide flat rectangular pastel stick \u2014 gives the broad broken strokes visible throughout the sample sheet; one of the most useful brushes in the set per the source'},
+ {name:'Recon Flat Soft',group:'Pastel Dry',shape:'flat',sizePx:45,maxSizePx:280,opacity:0.55,water:0,grain:0.55,flow:0.65,spacing:16,
+  scatter:3,rotationMode:'trajectory',grainGen:['Coarse Sponge',{density:5,detail:6,contrast:5}],smudgeOnStroke:true,smudgeDensity:85,grainSmoothing:false,
+  sizeBehavior:'custom',sizeCurve:'softPastel',opacityBehavior:'custom',opacityCurve:'softPastel',
+  note:'Softer flat pastel, heavier Smudge for smoother blended coverage'},
+ {name:'Recon Square Soft 2',group:'Pastel Dry',shape:'flat',sizePx:45,maxSizePx:230,opacity:0.55,water:0,grain:0.7,flow:0.65,spacing:18,
+  scatter:5,rotationMode:'trajectory',grainGen:['Coarse Sponge',{density:7,detail:6,contrast:6}],smudgeOnStroke:true,smudgeDensity:80,grainSmoothing:false,
+  sizeBehavior:'custom',sizeCurve:'softPastel',opacityBehavior:'custom',opacityCurve:'softPastel',
+  note:'The fuzzy square marks in the sample sheet'},
+ {name:'Recon Square Hard',group:'Pastel Dry',shape:'flat',sizePx:40,maxSizePx:220,opacity:0.9,water:0,grain:0.55,flow:0.9,spacing:12,
+  scatter:2,rotationMode:'trajectory',grainGen:['Granular Mineral',{density:6,detail:6,contrast:6}],smudgeOnStroke:false,grainSmoothing:false,
+  sizeBehavior:'custom',sizeCurve:'hardPastel',opacityBehavior:'custom',opacityCurve:'hardPastel',
+  note:'The dense square pastel \u2014 Granular Mineral grain for a grittier, more separated hard-pastel texture than the sponge presets used elsewhere in this family'},
+ {name:'Recon Hard',group:'Pastel Dry',shape:'round',sizePx:35,maxSizePx:120,opacity:0.95,water:0,grain:0.45,flow:0.95,spacing:10,
+  rotationMode:'trajectory',grainGen:['Granular Mineral',{density:5,detail:5,contrast:5}],smudgeOnStroke:false,grainSmoothing:false,
+  sizeBehavior:'custom',sizeCurve:'hardPastel',opacityBehavior:'custom',opacityCurve:'hardPastel',
+  note:'The hardest dry pastel in the set \u2014 no scatter, tight spacing, minimal jitter for a clean, controlled hard-pastel mark'},
+ // --- Pastel Oil & Wax (8, matching the real Rebelle Pastel Oil 7.1 set) ---
+ {name:'Recon Oil Pastel Flat',group:'Pastel Oil & Wax',shape:'flat',sizePx:45,maxSizePx:280,opacity:0.9,water:0,grain:0.45,flow:0.9,spacing:10,
+  scatter:1,rotationMode:'trajectory',grainGen:['Coarse Sponge',{density:5,detail:5,contrast:4}],smudgeOnStroke:true,smudgeDensity:75,grainSmoothing:true,
+  sizeBehavior:'custom',sizeCurve:'oilPastel',opacityBehavior:'custom',opacityCurve:'oilPastel',
+  note:'Flat oil-pastel stick \u2014 Grain Smoothing ON since oil pastel should have lower grain randomness/more solid opaque deposits than dry pastel, per the source'},
+ {name:'Recon Oil Liner',group:'Pastel Oil & Wax',shape:'liner',sizePx:30,maxSizePx:90,opacity:0.95,water:0,grain:0.35,flow:0.95,spacing:8,
+  rotationMode:'trajectory',grainGen:['Fine Sponge',{density:3,detail:4,contrast:3}],smudgeOnStroke:true,smudgeDensity:50,grainSmoothing:true,
+  sizeBehavior:'custom',sizeCurve:'oilPastel',opacityBehavior:'custom',opacityCurve:'oilPastel',
+  note:'Behaves like an oil-pastel pencil \u2014 fine liner shape, low grain, moderate smudge'},
+ {name:'Recon Wax Pencil',group:'Pastel Oil & Wax',shape:'round',sizePx:15,maxSizePx:100,opacity:1,water:0,grain:0.45,flow:0.95,spacing:10,
+  sizeJitter:6,opacityJitter:4,rotationMode:'trajectory',grainGen:['Coarse Sponge',{density:5,detail:5,contrast:5}],smudgeOnStroke:true,smudgeDensity:40,grainSmoothing:false,
+  sizeBehavior:'custom',sizeCurve:'oilPastel',opacityBehavior:'custom',opacityCurve:'oilPastel',
+  note:'The Pastel-family version of Wax Pencil (distinct from the Marker table\u2019s own Wax Pencil spec, matching the real Rebelle library having the name in both families) \u2014 Size 15/Opacity 100 read directly off the source screenshot'},
+ {name:'Recon Wax Soft',group:'Pastel Oil & Wax',shape:'round',sizePx:45,maxSizePx:220,opacity:0.7,water:0,grain:0.35,flow:0.7,spacing:10,
+  scatter:2,rotationMode:'trajectory',grainGen:['Fine Sponge',{density:3,detail:4,contrast:3}],smudgeOnStroke:true,smudgeDensity:85,grainSmoothing:true,
+  sizeBehavior:'custom',sizeCurve:'oilPastel',opacityBehavior:'custom',opacityCurve:'oilPastel',
+  note:'Smooth waxy strokes \u2014 low grain, high smudge density, Smoothing ON'},
+ {name:'Recon Wax Soft 2',group:'Pastel Oil & Wax',shape:'round',sizePx:50,maxSizePx:260,opacity:0.6,water:0,grain:0.25,flow:0.6,spacing:8,
+  rotationMode:'trajectory',grainGen:['Fine Sponge',{density:2,detail:3,contrast:2}],smudgeOnStroke:true,smudgeDensity:90,grainSmoothing:true,
+  sizeBehavior:'custom',sizeCurve:'oilPastel',opacityBehavior:'custom',opacityCurve:'oilPastel',
+  note:'Even creamier than Wax Soft \u2014 lowest grain in the whole Pastel table, highest smudge density'},
+ {name:'Recon Oil Pastel',group:'Pastel Oil & Wax',shape:'round',sizePx:45,maxSizePx:260,opacity:0.85,water:0,grain:0.5,flow:0.85,spacing:12,
+  scatter:3,rotationMode:'trajectory',grainGen:['Coarse Sponge',{density:5,detail:5,contrast:5}],smudgeOnStroke:true,smudgeDensity:70,grainSmoothing:true,
+  sizeBehavior:'custom',sizeCurve:'oilPastel',opacityBehavior:'custom',opacityCurve:'oilPastel',
+  note:'General-purpose oil pastel'},
+ {name:'Recon Oil Pastel 2',group:'Pastel Oil & Wax',shape:'round',sizePx:45,maxSizePx:280,opacity:0.8,water:0,grain:0.7,flow:0.8,spacing:18,
+  sizeJitter:18,opacityJitter:15,scatter:6,rotationMode:'trajectory',grainGen:['Coarse Sponge',{density:7,detail:6,contrast:6}],smudgeOnStroke:true,smudgeDensity:70,grainSmoothing:false,
+  sizeBehavior:'custom',sizeCurve:'oilPastel',opacityBehavior:'custom',opacityCurve:'oilPastel',
+  note:'Rougher oil pastel \u2014 higher size/opacity jitter and scatter, Grain Smoothing OFF'},
+ {name:'Recon Oil Pastel 3',group:'Pastel Oil & Wax',shape:'round',sizePx:50,maxSizePx:300,opacity:0.7,water:0,grain:0.85,flow:0.7,spacing:25,
+  sizeJitter:25,opacityJitter:20,spacingJitter:12,scatter:10,rotationMode:'trajectory',grainGen:['Coarse Sponge',{density:8,detail:7,contrast:7}],smudgeOnStroke:true,smudgeDensity:65,grainSmoothing:false,
+  sizeBehavior:'custom',sizeCurve:'oilPastel',opacityBehavior:'custom',opacityCurve:'oilPastel',
+  note:'Very textured \u2014 highest jitter/scatter of the Oil & Wax family'},
+ // --- Pastel Texture (4) + Scrape (2), matching Rebelle's real separate Texture/Scrape groups ---
+ {name:'Recon Pastel Dust',group:'Pastel Texture',shape:'splat',sizePx:45,maxSizePx:250,opacity:0.4,water:0,grain:0.9,flow:0.5,spacing:35,
+  sizeJitter:35,opacityJitter:30,spacingJitter:25,scatter:45,randomStart:true,randomStamp:true,rotationMode:'trajectory',
+  grainGen:['Spatter Dots',{density:8,detail:7,contrast:6}],smudgeOnStroke:false,grainSmoothing:false,
+  sizeBehavior:'custom',sizeCurve:'powder',opacityBehavior:'custom',opacityCurve:'powder',
+  note:'Loose scattered pastel dust \u2014 highest Scatter in the table (45), Random Start/Stamp so it never reads as an ordinary continuous stroke; Powder pressure curve never fully saturates even at max pressure'},
+ {name:'Recon Pastel Fragments',group:'Pastel Texture',shape:'splat',sizePx:40,maxSizePx:220,opacity:0.55,water:0,grain:0.85,flow:0.6,spacing:30,
+  sizeJitter:30,opacityJitter:25,spacingJitter:20,scatter:35,randomStamp:true,rotationMode:'trajectory',
+  grainGen:['Spatter Dots',{density:7,detail:7,contrast:6}],smudgeOnStroke:false,grainSmoothing:false,
+  sizeBehavior:'custom',sizeCurve:'powder',opacityBehavior:'custom',opacityCurve:'powder',
+  note:'Broken pastel fragments/chips \u2014 similar to Dust but slightly less scattered and without Random Start'},
+ {name:'Recon Pastel Pattern',group:'Pastel Texture',shape:'round',sizePx:40,maxSizePx:200,opacity:0.6,water:0,grain:0.9,flow:0.65,spacing:45,
+  scatter:8,rotationMode:'trajectory',grainGen:['Spatter Dots',{density:8,detail:6,contrast:6}],smudgeOnStroke:false,grainSmoothing:false,
+  sizeBehavior:'custom',sizeCurve:'powder',opacityBehavior:'custom',opacityCurve:'powder',
+  note:'Repeated granular pattern \u2014 wide fixed Spacing (45) with no Random Stamp, so dabs repeat in a regular rhythm rather than scattering chaotically like Dust/Fragments/Scrambled'},
+ {name:'Recon Scrambled Pastel',group:'Pastel Texture',shape:'splat',sizePx:45,maxSizePx:260,opacity:0.55,water:0,grain:0.95,flow:0.6,spacing:30,
+  sizeJitter:30,opacityJitter:25,spacingJitter:25,scatter:50,randomStart:true,randomStamp:true,rotationMode:'trajectory',
+  grainGen:['Spatter Dots',{density:9,detail:8,contrast:7}],smudgeOnStroke:false,grainSmoothing:false,
+  sizeBehavior:'custom',sizeCurve:'powder',opacityBehavior:'custom',opacityCurve:'powder',
+  note:'The most chaotic Texture brush \u2014 highest Scatter (50) and grain (0.95) in the whole Pastel table'},
+ {name:'Recon Wax Scrape',group:'Pastel Texture',shape:'knife',sizePx:40,maxSizePx:180,opacity:0.7,water:0,grain:0.65,flow:0.7,spacing:18,
+  rotationMode:'trajectory',grainGen:['Scratches',{density:6,detail:6,contrast:6}],smudgeOnStroke:true,smudgeDensity:90,grainSmoothing:false,
+  sizeBehavior:'custom',sizeCurve:'oilPastel',opacityBehavior:'custom',opacityCurve:'oilPastel',
+  note:'For scraping back into previously-applied pastel \u2014 knife shape + Scratches grain (directional gouges) + very high Smudge Density (90) deliberately combines scraping with smearing rather than depositing a conventional stroke, per the source\u2019s own framing'},
+ {name:'Recon Wax Scrape 2',group:'Pastel Texture',shape:'knife',sizePx:45,maxSizePx:220,opacity:0.8,water:0,grain:0.8,flow:0.8,spacing:25,
+  scatter:5,rotationMode:'trajectory',grainGen:['Scratches',{density:7,detail:7,contrast:7}],smudgeOnStroke:true,smudgeDensity:95,grainSmoothing:false,
+  sizeBehavior:'custom',sizeCurve:'oilPastel',opacityBehavior:'custom',opacityCurve:'oilPastel',
+  note:'More aggressive scrape \u2014 higher grain/scatter/Smudge Density than Wax Scrape'},
 ];
 /* =========================================================================
    INK RECONSTRUCTION — 40 brushes, from the user's Rebelle Ink library
@@ -2687,7 +3010,35 @@ function footprint(shape,size,angle,speed,brushObj){
   const liveTiltWiden = tiltSensitivity>0.01 ? livePenTilt.amount*tiltSensitivity : 0;
   const tilt=tiltSensitivity*0.35;
   const form=brushObj?(brushObj.brushForm||0)/100:0;
-  let rx=size*.5, ry=size*.5, rot=angle+tilt+(liveTiltWiden>0?livePenTilt.angleRad*tiltSensitivity*0.3:0);
+  // Rotation mode (Brush Creator > Stroke > Rotation): real Rebelle brushes can either
+  // follow the stroke's travel direction (the default this engine always did before, and
+  // still the base for 'trajectory'/unset), or ignore stroke direction entirely and stay at
+  // a fixed absolute angle ("None" — used by e.g. Bullet Marker, a round-ish tip where
+  // rotation shouldn't track the stroke at all). Shape Angle is then always added ON TOP of
+  // that base as a constant offset (not a replacement for it) — this is what lets Chisel
+  // Calligraphic combine "Rotation: Follow Trajectory" with its own 20° Shape Angle tilt,
+  // matching the source spec, while Chisel (plain) just uses Follow Trajectory with
+  // Shape Angle 0. 'fixed' mode is Shape Angle acting as the ENTIRE angle with no trajectory
+  // contribution at all (for a brush that should always lay down the exact same angled mark
+  // no matter which way the stroke travels).
+  const shapeAngleRad=(brushObj?(brushObj.shapeAngle||0):0)*Math.PI/180;
+  let baseAngle=angle+shapeAngleRad;
+  if(brushObj){
+    if(brushObj.rotationMode==='fixed') baseAngle=shapeAngleRad;
+    else if(brushObj.rotationMode==='none') baseAngle=shapeAngleRad;
+  }
+  // Angle Jitter / Random Start / Random Stamp (Brush Creator > Stroke): Random Stamp gives
+  // EVERY dab a fresh random rotation; Random Start randomizes only the very first dab of a
+  // stroke (subsequent dabs behave normally); Angle Jitter adds a small bounded random
+  // wobble around whatever angle the brush would otherwise use. strokeState.stampCount is
+  // incremented once per dab in paint(), so `===1` reliably identifies "first dab of this
+  // stroke" for Random Start without needing to thread an extra parameter through every
+  // deposit function that calls footprint().
+  let randomKick=0;
+  if(brushObj && brushObj.randomStamp) randomKick=Math.random()*Math.PI*2;
+  else if(brushObj && brushObj.randomStart && strokeState.stampCount===1) randomKick=Math.random()*Math.PI*2;
+  const angleJitterRad = brushObj && brushObj.angleJitterDeg ? (Math.random()-0.5)*2*(brushObj.angleJitterDeg*Math.PI/180) : 0;
+  let rx=size*.5, ry=size*.5, rot=baseAngle+tilt+angleJitterRad+randomKick+(liveTiltWiden>0?livePenTilt.angleRad*tiltSensitivity*0.3:0);
   switch(shape){
     case 'round': ry=size*(.5-.20*speed)*(1-form*.35)*(1-liveTiltWiden*0.6); break;
     case 'mop': case 'wash': rx=size*.62; ry=size*.42; break;
@@ -2955,12 +3306,22 @@ function pigmentApproachIncrement(old,amount,plateau){
 /* ---------- deposit: wet media (watercolor / ink / dryMedia / marker / airbrush) ---------- */
 function depositWet(L,x,y,pressure,angle,speed,b,bias){
   if(!L||L.locked) return;
-  const sizeK=evalCurve(b.sizeBehavior||'pressure',pressure,speed);
-  const size=clamp(b.size*(0.35+0.85*sizeK),2,b.maxSize||b.size*4);
-  const opacK=evalCurve(b.opacityBehavior||'pressure-soft',pressure,speed);
+  const sizeK=evalCurve(b.sizeBehavior||'pressure',pressure,speed,b.sizeCurve);
+  // Size Jitter (Brush Creator > Size): a real per-dab random size multiplier, +/- a
+  // percentage of the pressure-curve size, so consecutive dabs along a stroke vary slightly
+  // in size instead of every dab at a given pressure being pixel-identical — this is what
+  // gives rougher brushes (Liner Rough, Dry, Oval 2, Fragments...) their slightly uneven,
+  // hand-drawn edge instead of a mechanically smooth, perfectly consistent stroke width.
+  const sizeJitterMul = b.sizeJitter ? 1+(Math.random()-0.5)*2*clamp(b.sizeJitter/100,0,1) : 1;
+  const size=clamp(b.size*(0.35+0.85*sizeK)*sizeJitterMul,2,b.maxSize||b.size*4);
+  const opacK=evalCurve(b.opacityBehavior||'pressure-soft',pressure,speed,b.opacityCurve);
   const lengthNorm=(b.length!=null?b.length:100)/100; // 1=infinite paint, lower=runs out faster
   const loadFactor=lengthNorm>=0.99?1:clamp(1-strokeState.dist/(size*(8+lengthNorm*140)+1),0.05,1);
-  const amountBase=b.opacity*opacK*loadFactor;
+  // Opacity Jitter (Brush Creator > Opacity): same idea as Size Jitter but for per-dab
+  // opacity — a real random multiplier, not a proxy via color-jitter brightness like earlier
+  // reconstruction tables in this file used before this mechanism existed.
+  const opacityJitterMul = b.opacityJitter ? clamp(1+(Math.random()-0.5)*2*clamp(b.opacityJitter/100,0,1),0.05,2) : 1;
+  const amountBase=b.opacity*opacK*loadFactor*opacityJitterMul;
   const fp=footprint(b.shape,size,angle,speed,b);
   const stride=size>40?2:1;
   const col=(b.jitter && b.jitter.enabled && b.jitter.mode!=='bristle') ? getJitteredColor(b) : currentColorRGB();
@@ -2972,12 +3333,20 @@ function depositWet(L,x,y,pressure,angle,speed,b,bias){
   const seed=strokeState.seed||0;
   const grainAmt=b.grain*(0.4+V.textureInfluence/10);
   const mode=b.paintMode||'paintmix';
+  // Grain Smoothing (Brush Creator > Shape & Grain): OFF keeps the grain texture crisp/gritty
+  // at its native tile scale (the previous, only behavior); ON samples it at a larger tile
+  // scale and pulls the result partway toward its own mean, which is a real change to what
+  // gets rendered — softer, lower-contrast, less "sandy" grain — not just a cosmetic flag.
+  // Used by cleaner Marker brushes (grain should stay controlled, not turn into charcoal)
+  // vs. rougher Dry/Pastel brushes which explicitly want Smoothing OFF for maximum texture.
+  const grainScale = Math.max(4,size*0.5) * (b.grainSmoothing ? 1.7 : 1);
   forEachInDab(x,y,fp.rx,fp.ry,fp.rot,stride,(px,py,i,rr,nx,ny)=>{
     if(!inSelection(px,py)) return;
     const st=stencilAlpha(px,py); if(st<=0.02) return;
     const fall=b.shapeTex ? sampleTexShape(b.shapeTex,nx,ny) : Math.pow(1-rr,1.4);
     if(fall<=0.006) return;
-    const tooth=b.grainTex ? lerp(toothMap[i],sampleTexTiled(b.grainTex,px,py,Math.max(4,size*0.5)),0.7) : toothMap[i];
+    let tooth=b.grainTex ? lerp(toothMap[i],sampleTexTiled(b.grainTex,px,py,grainScale),0.7) : toothMap[i];
+    if(b.grainSmoothing) tooth=lerp(tooth,0.5,0.35);
     const turb=(bias.soft)?1:0.75+0.5*noise(px*0.02+seed,py*0.02-seed);
     let amount=amountBase*b.flow*fall*turb*st*(1-grainAmt*0.6+grainAmt*tooth)*bias.pigmentMul;
     if(amount<=0.0008) return;
@@ -3094,7 +3463,7 @@ function depositWet(L,x,y,pressure,angle,speed,b,bias){
 function depositOil(L,x,y,pressure,angle,speed,b){
   if(!L||L.locked) return;
   if(!strokeState.bristles) strokeState.bristles=makeBristles(b);
-  const sizeK=evalCurve(b.sizeBehavior||'pressure',pressure,speed);
+  const sizeK=evalCurve(b.sizeBehavior||'pressure',pressure,speed,b.sizeCurve);
   const size=clamp(b.size*(0.35+0.85*sizeK),2,b.maxSize||b.size*4);
   const lengthNorm=(b.length!=null?b.length:100)/100;
   const loadFactor=lengthNorm>=0.99?1:clamp(1-strokeState.dist/(size*(6+lengthNorm*120)+1),0.04,1);
@@ -3831,23 +4200,43 @@ const ELONGATED_SHAPES=['liner','flat','knife','fan'];
 function paint(a,b_){
   const L=activeLayer(); if(!L) return;
   const d=Math.max(0.6,dist(a,b_));
+  // Spacing Jitter (Brush Creator > Stroke): randomizes the gap between dabs +/- a
+  // percentage of the base spacing, so a stroke's stamps land slightly unevenly along its
+  // length rather than at perfectly uniform intervals — used by several of the rougher
+  // Marker/Pastel brushes (Liner Rough, Dry, Oval 2, etc.) to break up an otherwise too-
+  // mechanical repeating dab pattern.
   const spacingPct=clamp(brush.spacing!=null?brush.spacing:12,1.5,60)/100;
-  const spacing=Math.max(1,(brush.size||30)*spacingPct);
+  let spacing=Math.max(1,(brush.size||30)*spacingPct);
+  if(brush && brush.spacingJitter){ spacing=Math.max(1,spacing*(1+(Math.random()-0.5)*2*clamp(brush.spacingJitter/100,0,1))); }
   const steps=Math.ceil(d/spacing);
   let angle=Math.atan2(b_.y-a.y,b_.x-a.x);
-  if(brush && ELONGATED_SHAPES.includes(brush.shape) && strokeState.lastAngle!=null){
+  if(brush && ELONGATED_SHAPES.includes(brush.shape) && strokeState.lastAngle!=null && (!brush.rotationMode || brush.rotationMode==='trajectory')){
     // Ellipse footprints are symmetric under a 180° rotation, so compare/blend angles in
     // mod-PI space — that way a segment that's visually "the same direction, just measured
     // the other way" never gets treated as a near-180° jump that needs smoothing away.
+    // Skipped entirely for brushes with a fixed/none rotation mode (e.g. Chisel/Chisel
+    // Calligraphic markers) since their angle doesn't track stroke direction at all.
     const confidence=clamp(d/Math.max(4,(brush.size||30)*0.35),0,1);
     angle=strokeState.lastAngle+angleDeltaMod(angle,strokeState.lastAngle,Math.PI)*confidence;
   }
   strokeState.lastAngle=angle;
   const speed=clamp(d/(spacing*3),0,1);
+  // Scatter (Brush Creator > Stroke): a real per-stamp position offset perpendicular to the
+  // stroke direction, so a scattered brush's marks spread loosely to either side of the
+  // path the pen actually traveled instead of landing in a single continuous band — used by
+  // Pastel Dust/Fragments/Scrambled and several rougher Marker/Pastel brushes below.
+  // Perpendicular unit vector to the stroke direction:
+  const perpX=-Math.sin(angle), perpY=Math.cos(angle);
+  const scatterPx = brush && brush.scatter ? clamp(brush.scatter,0,100)/100*(brush.size||30)*0.6 : 0;
   for(let s=0;s<=steps;s++){
     const t=steps?s/steps:0;
-    const p={x:lerp(a.x,b_.x,t),y:lerp(a.y,b_.y,t),p:lerp(a.p,b_.p,t)};
+    let p={x:lerp(a.x,b_.x,t),y:lerp(a.y,b_.y,t),p:lerp(a.p,b_.p,t)};
     strokeState.dist=(strokeState.dist||0)+(steps?d/steps:0);
+    strokeState.stampCount=(strokeState.stampCount||0)+1;
+    if(scatterPx>0){
+      const off=(Math.random()-0.5)*2*scatterPx;
+      p={x:p.x+perpX*off,y:p.y+perpY*off,p:p.p};
+    }
     if(symmetry.enabled){
       symmetryCopies(p,angle).forEach(c=>dispatchStamp(L,c.p,c.angle,speed));
     } else {
@@ -4107,6 +4496,18 @@ document.addEventListener('keydown',e=>{
   if(e.key==='Escape' && selDraft){ selDraft=null; renderSelectionOverlay(); showPanelsAfterPaint(); return; }
   if(e.ctrlKey||e.metaKey||e.altKey) return; // reserved for Ctrl-drag resize, Alt-click clone source, etc.
   const k=e.key.toLowerCase();
+  // Brush size shortcuts: ] increases, [ decreases — the standard convention shared by
+  // Photoshop/Procreate/etc. Works for any tool whose active `brush` object has a `size`
+  // (paint tools plus Water/Dry/Eraser/Blend/Smudge/Blow/Clone, which all expose Size in
+  // their own Properties panel). Step scales with the current size (10%, min 1px) rather
+  // than a fixed pixel amount, so it feels proportional at both tiny and huge sizes, and is
+  // clamped the same way the existing Ctrl-drag resize gesture is (1..brush.maxSize||600).
+  if(!e.shiftKey && (e.key===']'||e.key==='[') && brush && typeof brush.size==='number'){
+    const step=Math.max(1,brush.size*0.1);
+    brush.size=clamp(brush.size+(e.key===']'?step:-step),1,brush.maxSize||600);
+    refreshBindings('brush'); updateStrokePreview();
+    e.preventDefault(); return;
+  }
   if(TOOLS_BY_ID[currentTool].kind==='paint' && brush){
     const opts=PAINT_MODES_BY_ENGINE[brush.engine]||['paint','paintmix','paintblend','blend','erase'];
     const numMap={'1':'paint','2':'paintmix','3':'paintblend','4':'blend','5':'erase'};
@@ -4410,6 +4811,20 @@ function setBrush(key,keepTool){
   if(brush.smudgeOnStroke==null) brush.smudgeOnStroke=false;
   if(brush.length==null) brush.length=100;
   if(brush.jitter==null) brush.jitter={enabled:false,mode:'stamp',hue:0,sat:0,bright:0};
+  // Defaults for the newer Marker/Pastel-driven Brush Creator mechanics (Size/Opacity
+  // Jitter, Spacing Jitter, Scatter, Rotation mode, Shape Angle, Angle Jitter, Grain
+  // Smoothing, Random Start/Stamp) — every one of these is a genuine, real engine field
+  // consumed in footprint()/paint()/depositWet() (see the code there), not cosmetic-only.
+  if(brush.sizeJitter==null) brush.sizeJitter=0;
+  if(brush.opacityJitter==null) brush.opacityJitter=0;
+  if(brush.spacingJitter==null) brush.spacingJitter=0;
+  if(brush.scatter==null) brush.scatter=0;
+  if(brush.rotationMode==null) brush.rotationMode='trajectory';
+  if(brush.shapeAngle==null) brush.shapeAngle=0;
+  if(brush.angleJitterDeg==null) brush.angleJitterDeg=0;
+  if(brush.grainSmoothing==null) brush.grainSmoothing=false;
+  if(brush.randomStart==null) brush.randomStart=false;
+  if(brush.randomStamp==null) brush.randomStamp=false;
   const modeOpts=PAINT_MODES_BY_ENGINE[brush.engine]||['paint','paintmix','paintblend','blend','erase'];
   if(brush.paintMode==null || !modeOpts.includes(brush.paintMode)) brush.paintMode=modeOpts.includes('paintmix')?'paintmix':'paint';
   brush.key=key;
@@ -4657,11 +5072,12 @@ function buildBrushCreator(){
     <button class="qbtn" id="bcExportPreset">Export Preset…</button>
   </div>`;
   if(bcTab==='stroke'){
-    html+=grpOpen('Size')+srow('Max Size (px)','brush.maxSize',20,1500,1)+srowSel('Size Behavior','brush.sizeBehavior',CURVE_KINDS.map(k=>[k,k]))+srow('Tip Tilt','brush.tipTilt',0,100,1)+srow('Brush Form','brush.brushForm',0,100,1)+grpClose();
-    html+=grpOpen('Opacity')+srow('Opacity','brush.opacity',0,1,0.01)+srowSel('Opacity Behavior','brush.opacityBehavior',CURVE_KINDS.map(k=>[k,k]))+grpClose();
-    html+=grpOpen('Spacing')+srow('Spacing','brush.spacing',1.5,60,0.5)+srowChk('Smudge','brush.smudgeOnStroke')+grpClose();
+    html+=grpOpen('Size')+srow('Max Size (px)','brush.maxSize',20,1500,1)+srowSel('Size Behavior','brush.sizeBehavior',CURVE_KINDS.map(k=>[k,k]))+srow('Size Jitter','brush.sizeJitter',0,100,1)+srow('Tip Tilt','brush.tipTilt',0,100,1)+srow('Brush Form','brush.brushForm',0,100,1)+grpClose();
+    html+=grpOpen('Opacity')+srow('Opacity','brush.opacity',0,1,0.01)+srowSel('Opacity Behavior','brush.opacityBehavior',CURVE_KINDS.map(k=>[k,k]))+srow('Opacity Jitter','brush.opacityJitter',0,100,1)+grpClose();
+    html+=grpOpen('Spacing')+srow('Spacing','brush.spacing',1.5,60,0.5)+srow('Spacing Jitter','brush.spacingJitter',0,100,1)+srow('Scatter','brush.scatter',0,100,1)+srowChk('Smudge','brush.smudgeOnStroke')+(brush.smudgeOnStroke?srow('Smudge Density','brush.smudgeDensity',0,100,1):'')+grpClose();
+    html+=grpOpen('Rotation')+srowSel('Rotation Mode','brush.rotationMode',[['trajectory','Follow Trajectory'],['fixed','Fixed (Shape Angle)'],['none','None']])+srow('Shape Angle','brush.shapeAngle',0,180,1)+srow('Angle Jitter','brush.angleJitterDeg',0,45,1)+srowChk('Random Start','brush.randomStart')+srowChk('Random Stamp','brush.randomStamp')+grpClose();
   } else if(bcTab==='shape'){
-    html+=grpOpen('Shape & Grain')+srow('Grain','brush.grain',0,1,0.01)+srow('Pigment Density','brush.pigment',0.02,1,0.01)+grpClose();
+    html+=grpOpen('Shape & Grain')+srow('Grain','brush.grain',0,1,0.01)+srow('Pigment Density','brush.pigment',0.02,1,0.01)+srowChk('Grain Smoothing','brush.grainSmoothing')+grpClose();
     html+=grpOpen('Brush Shape');
     html+=`<div class="texRow">
       <div class="texPreview">${brush.shapeTexURL?`<img src="${brush.shapeTexURL}">`:'<span class="tinyNote">procedural</span>'}</div>
