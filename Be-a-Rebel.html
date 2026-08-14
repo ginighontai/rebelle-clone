@@ -2766,8 +2766,16 @@ function updatePressureReadout(p){
   const el=document.getElementById('pressureReadout'); if(!el) return;
   if(!p){ el.textContent=''; return; }
   const isMouse=(p.pointerType||'mouse')==='mouse';
+  // IMPORTANT: pointerType==='mouse' does NOT necessarily mean the user has an actual mouse.
+  // A very common, well-documented tablet driver issue (Huion/Wacom/XP-Pen alike): if the
+  // driver's "Windows Ink" option is turned OFF, the tablet's own pen events get relayed to
+  // the browser as plain mouse events, and pointerType will read 'mouse' even though a real
+  // pressure-sensitive pen is what's actually touching the tablet. Browsers can only ever see
+  // PointerEvent.pressure on events tagged 'pen' — if it's tagged 'mouse', pressure is
+  // structurally unavailable no matter what this app (or any web app) does. So this message
+  // must cover BOTH real mice and misconfigured tablets, not claim "no pressure hardware".
   const label=isMouse
-    ? 'mouse — no pressure hardware, strokes are constant-width by design (use a pen/tablet for taper)'
+    ? 'reporting as "mouse" (pressure unavailable) — if you have a pen/tablet, enable "Windows Ink" in its driver settings so it reports as "pen" instead'
     : (p.pointerType||'mouse')+' · pressure '+(p.rawPressure!=null?p.rawPressure.toFixed(2):'—');
   el.textContent=label;
   el.style.color=isMouse?'#f2b400':'';
