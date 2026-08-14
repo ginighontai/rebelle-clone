@@ -1701,7 +1701,7 @@ function buildBrushesFromReconSpecs(specs,groupName,keyPrefix,defaultTool,defaul
       pencil:'dryMedia',pastel:'dryMedia',marker:'marker',airbrush:'airbrush'}[tool]||defaultEngine;
     const key=keyPrefix+'_'+idx+'_'+spec.name.toLowerCase().replace(/[^a-z0-9]+/g,'_');
     const b={
-      name:spec.name, group:groupName, tool, engine:engineForTool,
+      name:spec.name, group:spec.group||groupName, tool, engine:engineForTool,
       shape:spec.shape, size:spec.sizePx, maxSize:spec.maxSizePx!=null?spec.maxSizePx:clamp(spec.sizePx*6,60,900),
       opacity:spec.opacity, flow:spec.flow, water:spec.water, blend:spec.blend!=null?spec.blend:0.3,
       grain:spec.grain, pigment:spec.pigment!=null?spec.pigment:0.2,
@@ -1712,7 +1712,7 @@ function buildBrushesFromReconSpecs(specs,groupName,keyPrefix,defaultTool,defaul
       smudgeOnStroke:!!spec.smudgeOnStroke, smudgeDensity:spec.smudgeDensity!=null?spec.smudgeDensity:80,
       length:100, mixingMode:spec.mixingMode||'transparent', paintMode:spec.paintMode||'paintmix',
       jitter:spec.jitter?{...spec.jitter}:{enabled:false,mode:'stamp',hue:0,sat:0,bright:0},
-      key, reconstructedFromSheet:true, reconstructionNote:spec.note,
+      key, reconstructedFromSheet:true, reconstructionNote:spec.note, defaultColor:spec.defaultColor||null,
     };
     if(spec.shapeGen){
       const built=buildShapeTextureFor(spec.shapeGen[0],spec.shapeGen[1]);
@@ -1729,7 +1729,152 @@ function buildReconstructedBrushLibrary(){
   buildBrushesFromReconSpecs(RECON_BRUSH_SPECS,'Reconstructed (from sample sheet)','recon',null,null);
   buildBrushesFromReconSpecs(WATERCOLOR_RECON_SPECS,'Reconstructed Watercolor (from library screenshot)','reconwc','watercolor','watercolor');
   buildBrushesFromReconSpecs(INK_RECON_SPECS,'Reconstructed Ink (40-brush pack)','reconink','ink','ink');
+  buildBrushesFromReconSpecs(PENCIL_RECON_SPECS,null,'reconpencil','pencil','dryMedia'); // each spec carries its own sub-group (Charcoal/Digital/Dry Media/Scratches)
 }
+/* =========================================================================
+   PENCIL RECONSTRUCTION — 30 brushes, from the user's Rebelle Pencil
+   library screenshot (Charcoal, Digital, Dry Media, and Scratches groups)
+   plus a detailed family-by-family Brush Creator reconstruction. Same
+   honest framing as the ink/watercolor/graphite sets before it: these are
+   VISUAL reconstruction presets, not claims of Rebelle's actual saved
+   numbers, which the source explicitly states can't be recovered from a
+   screenshot alone. Organized into the same 4 sub-groups the user's
+   screenshot and Rebelle's own official Pencil library use: Charcoal (10),
+   Digital (10), Dry Media (7), Scratches (3) — 30 total.
+   Field mapping (same conventions as the previous 3 reconstruction
+   tables, documented once per-table rather than repeated per-field here):
+     - Max Size/Size(%) -> maxSize/size(px), 0.4x scaled
+     - Opacity(%) -> opacity(0-1) directly; Water is always 0 for pencils
+       (dryMedia engine bias already has waterMul:0, so there is nothing
+       for a water value to affect — pencils are a pigment-only medium)
+     - Grain Strength(%) -> grain(0-1) + a matching real procedural preset
+       per family: Fine Sponge (Digital, minimal grain), Coarse Sponge
+       (Charcoal, coarse irregular), Scratches (Dry Media's Lino/Scratches
+       families, scratchy linear marks), Spatter Dots (Dust/Powder,
+       granular/scattered deposits)
+     - Pressure->Size/Opacity(+N) -> sizeBehavior/opacityBehavior curve
+       ('pressure' for strong >=55, 'pressure-soft' for 25-54, 'constant'
+       below 25 — thresholds shifted slightly higher than the ink/
+       watercolor tables since the source's own pencil pressure curves
+       described in section 30 imply MORE pressure sensitivity overall
+       for this family, not less)
+     - Spacing -> brush.spacing directly (literal 1:1, as in every prior
+       reconstruction table)
+     - Tip Tilt -> brush.tipTilt, which now drives REAL stylus tilt
+       response (see the new livePenTilt mechanism added alongside this
+       table) for the two 'Tilted Hard'/'Tilted Hard 2' brushes, not just
+       a fixed per-brush constant — an actual tilted pen widens the mark
+       in real time on hardware that reports PointerEvent.tiltX/tiltY.
+     - Default Color -> brush.defaultColor, a NEW real feature (also added
+       alongside this table): selecting a brush with a saved defaultColor
+       now sets the app's current color to it automatically, matching the
+       Rebelle manual's documented Brush Creator > Paint > Rendering >
+       Default Color behavior. Values used: Hard Pencil family #303030,
+       Soft Pencil family #555555, Charcoal family #242424, Powder/Dust
+       family #686868, Scratch family #383838, Digital Flat family #404040
+       — matching the source's own recommended graphite/charcoal palette.
+   Not implemented (no equivalent in this engine, same honest limits as
+   prior tables): Angle Jitter, true per-stamp position Scatter, Random
+   Start/Stamp Offset, a dedicated pressure Curve Editor (this engine's
+   'pressure'/'pressure-soft'/'constant' behaviors are a fixed exponential
+   curve per kind, not an arbitrary user-drawn curve like Rebelle's real
+   Curve Editor), Grain Follow/Stretched/Tiled mode switching. ========================================================================= */
+const PENCIL_RECON_SPECS=[
+ {name:'Recon Charcoal Liner',group:'Charcoal',shape:'liner',sizePx:13,maxSizePx:28,opacity:0.85,water:0,grain:0.55,flow:0.892,spacing:12,
+  grainGen:['Chisel Streaks',{density:5,detail:5,contrast:5}],smudgeOnStroke:false,defaultColor:'#242424',
+  sizeBehavior:'pressure',opacityBehavior:'pressure-soft'},
+ {name:'Recon Charcoal',group:'Charcoal',shape:'round',sizePx:29,maxSizePx:72,opacity:0.75,water:0,grain:0.7,flow:0.788,spacing:20,
+  grainGen:['Coarse Sponge',{density:6,detail:6,contrast:6}],smudgeOnStroke:true,smudgeDensity:70,defaultColor:'#242424',
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft'},
+ {name:'Recon Charcoal 2',group:'Charcoal',shape:'round',sizePx:29,maxSizePx:68,opacity:0.7,water:0,grain:0.82,flow:0.735,spacing:28,
+  grainGen:['Coarse Sponge',{density:8,detail:7,contrast:8}],smudgeOnStroke:true,smudgeDensity:65,defaultColor:'#242424',
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft'},
+ {name:'Recon Charcoal 3',group:'Charcoal',shape:'round',sizePx:36,maxSizePx:80,opacity:0.9,water:0,grain:0.75,flow:0.945,spacing:18,
+  grainGen:['Coarse Sponge',{density:7,detail:7,contrast:7}],smudgeOnStroke:true,smudgeDensity:80,defaultColor:'#242424',
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',
+  note:'One of the presets for the darkest marks in the right-hand column of the sample sheet'},
+ {name:'Recon Charcoal Flat',group:'Charcoal',shape:'flat',sizePx:35,maxSizePx:88,opacity:0.75,water:0,grain:0.55,flow:0.788,spacing:20,
+  grainGen:['Chisel Streaks',{density:6,detail:5,contrast:5}],smudgeOnStroke:true,smudgeDensity:70,defaultColor:'#242424',
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft'},
+ {name:'Recon Charcoal Flat 2',group:'Charcoal',shape:'flat',sizePx:41,maxSizePx:92,opacity:0.8,water:0,grain:0.68,flow:0.84,spacing:25,
+  grainGen:['Chisel Streaks',{density:7,detail:6,contrast:6}],smudgeOnStroke:true,smudgeDensity:75,defaultColor:'#242424',
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft'},
+ {name:'Recon Charcoal Flat 3',group:'Charcoal',shape:'flat',sizePx:56,maxSizePx:112,opacity:0.65,water:0,grain:0.78,flow:0.683,spacing:28,
+  grainGen:['Chisel Streaks',{density:8,detail:7,contrast:7}],smudgeOnStroke:true,smudgeDensity:80,defaultColor:'#242424',
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft'},
+ {name:'Recon Charcoal Wide',group:'Charcoal',shape:'flat',sizePx:63,maxSizePx:140,opacity:0.55,water:0,grain:0.6,flow:0.578,spacing:22,
+  grainGen:['Chisel Streaks',{density:7,detail:6,contrast:6}],smudgeOnStroke:true,smudgeDensity:85,defaultColor:'#242424',
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',note:'Large shading tool \u2014 widest brush in the Charcoal family.'},
+ {name:'Recon Dust',group:'Charcoal',shape:'splat',sizePx:35,maxSizePx:88,opacity:0.45,water:0,grain:0.9,flow:0.473,spacing:35,
+  grainGen:['Spatter Dots',{density:8,detail:7,contrast:6}],smudgeOnStroke:false,defaultColor:'#686868',
+  sizeBehavior:'pressure-soft',opacityBehavior:'constant',note:'Deliberately NOT drawn as a normal pencil line \u2014 loose charcoal powder via Spatter Dots grain + splat shape'},
+ {name:'Recon Powder',group:'Charcoal',shape:'splat',sizePx:45,maxSizePx:100,opacity:0.4,water:0,grain:0.95,flow:0.42,spacing:45,
+  grainGen:['Spatter Dots',{density:9,detail:8,contrast:6}],smudgeOnStroke:false,defaultColor:'#686868',
+  sizeBehavior:'pressure-soft',opacityBehavior:'constant',note:'For charcoal dust/shading, not for drawing lines, per the source guidance'},
+ {name:'Recon Round Soft',group:'Digital',shape:'round',sizePx:22,maxSizePx:48,opacity:1,water:0,grain:0.15,flow:1,spacing:8,
+  grainGen:['Fine Sponge',{density:1,detail:2,contrast:2}],smudgeOnStroke:false,defaultColor:'#555555',
+  sizeBehavior:'pressure',opacityBehavior:'pressure-soft'},
+ {name:'Recon Round Soft 2',group:'Digital',shape:'round',sizePx:25,maxSizePx:56,opacity:0.95,water:0,grain:0.25,flow:0.997,spacing:10,
+  grainGen:['Fine Sponge',{density:2,detail:3,contrast:3}],smudgeOnStroke:false,defaultColor:'#555555',
+  sizeBehavior:'pressure',opacityBehavior:'pressure-soft'},
+ {name:'Recon Round Soft 3',group:'Digital',shape:'round',sizePx:27,maxSizePx:60,opacity:1,water:0,grain:0.2,flow:1,spacing:9,
+  grainGen:['Fine Sponge',{density:2,detail:2,contrast:2}],smudgeOnStroke:false,defaultColor:'#555555',
+  sizeBehavior:'pressure',opacityBehavior:'pressure-soft',
+  note:'The brush selected in the screenshot \u2014 Size 45/Opacity 100 read directly off the Properties panel'},
+ {name:'Recon Round Soft 4',group:'Digital',shape:'round',sizePx:36,maxSizePx:72,opacity:0.65,water:0,grain:0.35,flow:0.683,spacing:12,
+  grainGen:['Fine Sponge',{density:3,detail:4,contrast:3}],smudgeOnStroke:true,smudgeDensity:75,defaultColor:'#555555',
+  sizeBehavior:'pressure',opacityBehavior:'pressure-soft',note:'The very soft shading pencil of the Digital family'},
+ {name:'Recon Round Hard',group:'Digital',shape:'round',sizePx:14,maxSizePx:40,opacity:1,water:0,grain:0.08,flow:1,spacing:6,
+  grainGen:['Fine Sponge',{density:1,detail:1,contrast:1}],smudgeOnStroke:false,defaultColor:'#303030',
+  sizeBehavior:'pressure',opacityBehavior:'pressure-soft',note:'Clean drawing pencil \u2014 minimal grain, tight spacing'},
+ {name:'Recon Round Hard 2',group:'Digital',shape:'round',sizePx:19,maxSizePx:48,opacity:1,water:0,grain:0.12,flow:1,spacing:7,
+  grainGen:['Fine Sponge',{density:1,detail:2,contrast:1}],smudgeOnStroke:false,defaultColor:'#303030',
+  sizeBehavior:'pressure',opacityBehavior:'pressure-soft'},
+ {name:'Recon Tilted Hard',group:'Digital',shape:'flat',sizePx:29,maxSizePx:64,opacity:1,water:0,grain:0.1,flow:1,spacing:8,tipTilt:80,
+  grainGen:['Fine Sponge',{density:1,detail:1,contrast:1}],smudgeOnStroke:false,defaultColor:'#303030',
+  sizeBehavior:'pressure',opacityBehavior:'pressure-soft',
+  note:'Tip Tilt enabled (80) \u2014 real stylus tilt widens this mark on hardware reporting tiltX/tiltY; vertical pen stays a narrow line, tilted pen broadens like graphite shading'},
+ {name:'Recon Tilted Hard 2',group:'Digital',shape:'flat',sizePx:36,maxSizePx:80,opacity:0.9,water:0,grain:0.2,flow:0.945,spacing:10,tipTilt:95,
+  grainGen:['Fine Sponge',{density:2,detail:2,contrast:2}],smudgeOnStroke:false,defaultColor:'#303030',
+  sizeBehavior:'pressure',opacityBehavior:'pressure-soft',note:'More aggressive Tip Tilt (95) than Tilted Hard \u2014 broader shading response'},
+ {name:'Recon Flat',group:'Digital',shape:'flat',sizePx:22,maxSizePx:56,opacity:0.95,water:0,grain:0.15,flow:0.997,spacing:8,
+  grainGen:['Fine Sponge',{density:1,detail:2,contrast:2}],smudgeOnStroke:false,defaultColor:'#404040',
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft'},
+ {name:'Recon Flat 2',group:'Digital',shape:'flat',sizePx:32,maxSizePx:72,opacity:0.8,water:0,grain:0.25,flow:0.84,spacing:12,
+  grainGen:['Fine Sponge',{density:2,detail:3,contrast:2}],smudgeOnStroke:true,smudgeDensity:60,defaultColor:'#404040',
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft'},
+ {name:'Recon Textured',group:'Dry Media',shape:'round',sizePx:24,maxSizePx:60,opacity:0.75,water:0,grain:0.65,flow:0.788,spacing:25,
+  grainGen:['Coarse Sponge',{density:5,detail:6,contrast:5}],smudgeOnStroke:false,defaultColor:'#3a3a3a',
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft'},
+ {name:'Recon Textured 2',group:'Dry Media',shape:'round',sizePx:29,maxSizePx:68,opacity:0.7,water:0,grain:0.75,flow:0.735,spacing:30,
+  grainGen:['Coarse Sponge',{density:6,detail:7,contrast:6}],smudgeOnStroke:false,defaultColor:'#3a3a3a',
+  sizeBehavior:'pressure-soft',opacityBehavior:'constant'},
+ {name:'Recon Textured 3',group:'Dry Media',shape:'round',sizePx:36,maxSizePx:80,opacity:0.65,water:0,grain:0.85,flow:0.683,spacing:35,
+  grainGen:['Coarse Sponge',{density:7,detail:8,contrast:7}],smudgeOnStroke:false,defaultColor:'#3a3a3a',
+  sizeBehavior:'pressure-soft',opacityBehavior:'constant'},
+ {name:'Recon Powder 2',group:'Dry Media',shape:'splat',sizePx:40,maxSizePx:88,opacity:0.45,water:0,grain:0.9,flow:0.473,spacing:40,
+  grainGen:['Spatter Dots',{density:7,detail:6,contrast:5}],smudgeOnStroke:false,defaultColor:'#686868',
+  sizeBehavior:'pressure-soft',opacityBehavior:'constant'},
+ {name:'Recon Powder 3',group:'Dry Media',shape:'splat',sizePx:52,maxSizePx:104,opacity:0.4,water:0,grain:0.95,flow:0.42,spacing:50,
+  grainGen:['Spatter Dots',{density:8,detail:7,contrast:5}],smudgeOnStroke:false,defaultColor:'#686868',
+  sizeBehavior:'pressure-soft',opacityBehavior:'constant',
+  note:'Named "Powder 3" here to avoid a duplicate key with the Charcoal group\u2019s own "Powder" brush \u2014 corresponds to the official library\u2019s Dry Media > Powder 2'},
+ {name:'Recon Lino',group:'Dry Media',shape:'liner',sizePx:14,maxSizePx:48,opacity:0.8,water:0,grain:0.8,flow:0.84,spacing:30,
+  grainGen:['Scratches',{density:5,detail:7,contrast:6}],smudgeOnStroke:false,defaultColor:'#383838',
+  sizeBehavior:'pressure-soft',opacityBehavior:'constant',note:'Scratchy printmaking effect'},
+ {name:'Recon Lino Large',group:'Dry Media',shape:'liner',sizePx:45,maxSizePx:100,opacity:0.7,water:0,grain:0.9,flow:0.735,spacing:35,
+  grainGen:['Scratches',{density:7,detail:8,contrast:7}],smudgeOnStroke:false,defaultColor:'#383838',
+  sizeBehavior:'pressure-soft',opacityBehavior:'constant'},
+ {name:'Recon Scratch Thin',group:'Scratches',shape:'liner',sizePx:4,maxSizePx:16,opacity:0.75,water:0,grain:0.6,flow:0.788,spacing:18,
+  grainGen:['Scratches',{density:4,detail:6,contrast:5}],smudgeOnStroke:false,defaultColor:'#383838',
+  sizeBehavior:'pressure',opacityBehavior:'pressure-soft'},
+ {name:'Recon Scratch',group:'Scratches',shape:'liner',sizePx:10,maxSizePx:32,opacity:0.7,water:0,grain:0.75,flow:0.735,spacing:25,
+  grainGen:['Scratches',{density:6,detail:7,contrast:6}],smudgeOnStroke:false,defaultColor:'#383838',
+  sizeBehavior:'pressure',opacityBehavior:'pressure-soft'},
+ {name:'Recon Scratches 2',group:'Scratches',shape:'liner',sizePx:17,maxSizePx:48,opacity:0.65,water:0,grain:0.85,flow:0.683,spacing:32,
+  grainGen:['Scratches',{density:7,detail:8,contrast:7}],smudgeOnStroke:false,defaultColor:'#383838',
+  sizeBehavior:'pressure',opacityBehavior:'pressure-soft'},
+];
 /* =========================================================================
    INK RECONSTRUCTION — 40 brushes, from the user's Rebelle Ink library
    screenshot plus a detailed family-by-family Brush Creator reconstruction
@@ -2531,11 +2676,20 @@ function setColor(hex,skipRecent){
 /* ---------- footprint / bristles ---------- */
 function footprint(shape,size,angle,speed,brushObj){
   speed=speed||0;
-  const tilt=brushObj?(brushObj.tipTilt||0)/100*0.35:0;
+  // Tip Tilt: when a brush has this set, blend in whatever real stylus tilt hardware is
+  // reporting RIGHT NOW (livePenTilt, updated per pointer event) — a pen laid nearly flat
+  // (tiltAmount near 1) widens the mark toward a flat/shading footprint, a pen held near-
+  // vertical (tiltAmount near 0) keeps it narrow, matching the manual's described behavior
+  // for graphite Tip Tilt brushes. brushObj.tipTilt still acts as the brush's own base
+  // sensitivity/rotation offset for tools or input devices with no real tilt signal (mouse,
+  // or a pen that doesn't report tiltX/tiltY) so those brushes still behave reasonably.
+  const tiltSensitivity=brushObj?(brushObj.tipTilt||0)/100:0;
+  const liveTiltWiden = tiltSensitivity>0.01 ? livePenTilt.amount*tiltSensitivity : 0;
+  const tilt=tiltSensitivity*0.35;
   const form=brushObj?(brushObj.brushForm||0)/100:0;
-  let rx=size*.5, ry=size*.5, rot=angle+tilt;
+  let rx=size*.5, ry=size*.5, rot=angle+tilt+(liveTiltWiden>0?livePenTilt.angleRad*tiltSensitivity*0.3:0);
   switch(shape){
-    case 'round': ry=size*(.5-.20*speed)*(1-form*.35); break;
+    case 'round': ry=size*(.5-.20*speed)*(1-form*.35)*(1-liveTiltWiden*0.6); break;
     case 'mop': case 'wash': rx=size*.62; ry=size*.42; break;
     case 'flat': rx=size*.66; ry=size*.16*(1+form*.6); break;
     case 'filbert': rx=size*.52; ry=size*.30; break;
@@ -2565,13 +2719,37 @@ function makeBristles(brushObj){
 }
 
 /* ---------- generic elliptical stamp iterator ---------- */
+// BUG FIX (found via actual browser testing, not just code review — the true cause of what
+// initially looked like a "Chisel Streaks grain is broken" problem while testing the Pencil
+// brush set): for any brush whose footprint radius exceeds the size>40/50 thresholds used by
+// depositWet/depositOil/toolWater/toolBlow below, those callers pass stride=2 as a perf
+// shortcut, meaning only every OTHER pixel column/row is sampled per dab. That's fine for a
+// single dab in isolation — but every dab along a real stroke shares the exact same
+// absolute-pixel grid alignment (dabs move by whole-pixel amounts, so x%2/y%2 parity never
+// shifts on its own), so the SAME half of the columns were skipped by EVERY dab for the
+// ENTIRE length of the stroke, leaving permanent 1px-period unpainted seams running the full
+// length of any stroke from a >=40px dry-media/watercolor/ink brush — this is exactly what
+// looked like "broken dashes" and was originally (wrongly) blamed on the Chisel Streaks
+// grain preset specifically; confirmed as unrelated to grain by stripping a brush's grain
+// texture entirely and reproducing the identical stripe pattern with grain disabled outright.
+// Fix: give every dab a fresh RANDOM sub-pixel phase offset instead of a fixed one. A fixed
+// or short deterministically-cycling offset still leaves a faint periodic density ripple at
+// the stride frequency (some pixels end up hit by a slightly different dab count than their
+// neighbors as a stroke progresses); a random offset means which pixels get skipped differs
+// dab-to-dab, so across the many heavily-overlapping dabs along a real stroke every pixel
+// converges to almost the same average hit count — no periodicity survives, and any leftover
+// unevenness reads as natural grain noise rather than a mechanical comb/grid pattern.
 function forEachInDab(cx,cy,rx,ry,rot,stride,cb){
   const cos=Math.cos(-rot), sin=Math.sin(-rot);
   const R=Math.max(rx,ry);
   const minx=Math.max(0,Math.floor(cx-R)), maxx=Math.min(W-1,Math.ceil(cx+R));
   const miny=Math.max(0,Math.floor(cy-R)), maxy=Math.min(H-1,Math.ceil(cy+R));
-  for(let y=miny;y<=maxy;y+=stride){
-    for(let x=minx;x<=maxx;x+=stride){
+  let offX=0, offY=0;
+  if(stride>1){ offX=(Math.random()*stride)|0; offY=(Math.random()*stride)|0; }
+  const startY=miny+((offY-miny)%stride+stride)%stride;
+  const startX=minx+((offX-minx)%stride+stride)%stride;
+  for(let y=startY;y<=maxy;y+=stride){
+    for(let x=startX;x<=maxx;x+=stride){
       const dx=x-cx, dy=y-cy;
       const lx=dx*cos-dy*sin, ly=dx*sin+dy*cos;
       const nx=lx/rx, ny=ly/ry;
@@ -3554,6 +3732,10 @@ function applyPressureCurve(p){
 // and (b) surface a real "no pressure detected" warning in the status bar instead of just
 // painting every stroke at a constant medium weight, which is indistinguishable from a bug.
 let pressureDiag={pointerType:null,samples:[],distinct:new Set(),warned:false,lastReadout:0};
+// Live stylus tilt state, updated on every pointer event (see pointFromEvent) — read by
+// footprint() for real-time Tip Tilt brush response. Defaults to "no tilt" so mouse/no-tilt
+// hardware never accidentally widens a Tip Tilt brush.
+let livePenTilt={amount:0,angleRad:0};
 function notePressureSample(e){
   if(e.pointerType) pressureDiag.pointerType=e.pointerType;
   if(typeof e.pressure==='number'){
@@ -3589,12 +3771,22 @@ function pointFromEvent(e){
     pressureDiag.warned=true;
     setStatus('No real pen pressure detected from this tablet — in your Huion/Wacom/XP-Pen driver, enable "Windows Ink" (or WinTab-over-Ink compatibility) so the browser receives PointerEvent.pressure.');
   }
+  // Real stylus tilt (PointerEvent.tiltX/tiltY, -90..90 deg each, per spec): a genuinely
+  // tilted pen reports large tiltX/tiltY magnitudes, a pen held vertical reports near 0.
+  // Combined into a single 0..1 "how tilted is the pen right now" value so Tip Tilt brushes
+  // (see footprint()) can widen from a narrow vertical-pen mark to a broad tilted-pen mark
+  // in real time, matching the manual's description, instead of a brush-preset constant.
+  const tiltXraw=(typeof e.tiltX==='number')?e.tiltX:0, tiltYraw=(typeof e.tiltY==='number')?e.tiltY:0;
+  const tiltAmount=clamp(Math.hypot(tiltXraw,tiltYraw)/90,0,1);
+  const tiltAngleRad=Math.atan2(tiltYraw,tiltXraw);
+  livePenTilt={amount:tiltAmount,angleRad:tiltAngleRad};
   return {
     x:clamp((e.clientX-rect.left)*W/rect.width,0,W-1),
     y:clamp((e.clientY-rect.top)*H/rect.height,0,H-1),
     p:applyPressureCurve(clamp(rawP,0.04,1)),
     rawPressure:rawP,
-    pointerType:e.pointerType||'mouse'
+    pointerType:e.pointerType||'mouse',
+    tiltAmount, tiltAngleRad,
   };
 }
 function activeLayer(){ return layers[activeLayerIdx]; }
@@ -4224,6 +4416,12 @@ function setBrush(key,keepTool){
   lastBrushForTool[brush.tool]=key;
   if(!keepTool) currentTool=brush.tool;
   recentBrushes=recentBrushes.filter(k=>k!==key); recentBrushes.unshift(key); if(recentBrushes.length>8) recentBrushes.pop();
+  // Default Color (Brush Creator > Paint > Rendering > Default Color, per the Rebelle
+  // manual): a brush preset can carry its own saved color — most useful for pencils/
+  // charcoal, where a specific graphite/charcoal grey is part of the brush's identity.
+  // Applying it here means selecting the brush recalls that color automatically, exactly
+  // like the documented behavior; the user can still repaint over it with any other color.
+  if(brush.defaultColor) setColor(brush.defaultColor,true);
   buildToolsGridActive(); buildBrushesPanel(); buildPropertiesPanel(); buildBrushCreator(); updateQuickbar();
 }
 function buildPropertiesPanel(){
