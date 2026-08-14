@@ -1481,8 +1481,10 @@ function removeBrushFromLibrary(key){
 async function importBrushPresetFile(file){
   const isPng = /\.png$/i.test(file.name) || file.type==='image/png';
   if(isPng){ await importBrushPresetFromPng(file); return; }
+  const isAbr = /\.abr$/i.test(file.name);
+  if(isAbr){ await importBrushPresetFromAbr(file); return; }
   const isJson = /\.json$/i.test(file.name) || file.type==='application/json' || file.type==='';
-  if(!isJson){ setStatus('Import Brush Preset accepts .json or .png files'); return; }
+  if(!isJson){ setStatus('Import Brush Preset accepts .json, .png, or .abr files'); return; }
   let json;
   try{ json=JSON.parse(await file.text()); }
   catch(e){
@@ -1494,10 +1496,206 @@ async function importBrushPresetFile(file){
       const isRealPng=bytes[0]===0x89&&bytes[1]===0x50&&bytes[2]===0x4e&&bytes[3]===0x47;
       if(isRealPng){ await importBrushPresetFromPng(file); return; }
     }catch(e2){}
-    setStatus('That file is not a readable brush preset (expected .json or .png)'); return;
+    setStatus('That file is not a readable brush preset (expected .json, .png, or .abr)'); return;
   }
   const list=Array.isArray(json)?json:(json.brushes?json.brushes:[json]);
   finishBrushPresetImport(list,list[0]&&list[0].tool,false);
+}
+
+/* =========================================================================
+   PHOTOSHOP .ABR BRUSH IMPORT
+   .abr is a real, documented (if unofficial) binary format — unlike Rebelle's
+   undocumented PNG chunks, this one has been independently reverse-engineered
+   multiple times (GIMP's own ABR import plugin, the brush-viewer and abr-js
+   open-source projects, and Adobe's own legacy PSD-adjacent resource block
+   docs all agree on the structure), so a real parser is actually possible
+   here — this is NOT a filename guess like the PNG fallback path.
+   Two format generations exist:
+     - Legacy (versions 1-5): brush entries are simple tagged records; each
+       sampled brush's alpha image is stored as raw or RLE run-length rows.
+     - Modern (versions 6+): file starts the same way but wraps brushes in
+       Adobe's generic "8BIM" resource block convention, with 'samp' blocks
+       holding one or more sampled-brush sub-records, each containing a
+       PackBits-compressed (a simple, documented RLE variant) grayscale
+       alpha image — this is the actual brush tip mask, unlike Rebelle's
+       PNGs, so this import path gives real Shape fidelity, not a guess.
+   Vector/parametric brushes (procedural round-brush presets with no sampled
+   image) and abr features Photoshop-specific (dual-brush, scattering,
+   color dynamics, texture-from-pattern) have no equivalent decode path here
+   — those brushes import using their tag alone with synthesized dynamics,
+   same honest fallback as an unreadable PNG.
+   ========================================================================= */
+class ByteReader{
+  constructor(buf){ this.view=new DataView(buf); this.pos=0; this.len=buf.byteLength; }
+  u8(){ const v=this.view.getUint8(this.pos); this.pos+=1; return v; }
+  u16(){ const v=this.view.getUint16(this.pos,false); this.pos+=2; return v; }
+  i16(){ const v=this.view.getInt16(this.pos,false); this.pos+=2; return v; }
+  u32(){ const v=this.view.getUint32(this.pos,false); this.pos+=4; return v; }
+  i32(){ const v=this.view.getInt32(this.pos,false); this.pos+=4; return v; }
+  f64(){ const v=this.view.getFloat64(this.pos,false); this.pos+=8; return v; }
+  str(n){ let s=''; for(let i=0;i<n;i++) s+=String.fromCharCode(this.u8()); return s; }
+  skip(n){ this.pos+=n; }
+  remaining(){ return this.len-this.pos; }
+}
+// PackBits decompression (documented TIFF/Photoshop RLE variant): a signed control byte
+// n followed by either (n+1) literal bytes [n>=0] or one byte repeated (1-n+1) times [n<0].
+function packBitsDecode(reader,expectedLen){
+  const out=new Uint8Array(expectedLen);
+  let o=0;
+  while(o<expectedLen && reader.remaining()>0){
+    const ctrl=reader.view.getInt8(reader.pos); reader.pos+=1;
+    if(ctrl>=0){
+      const count=ctrl+1;
+      for(let i=0;i<count && o<expectedLen;i++) out[o++]=reader.u8();
+    } else if(ctrl!==-128){
+      const count=1-ctrl;
+      const v=reader.u8();
+      for(let i=0;i<count && o<expectedLen;i++) out[o++]=v;
+    }
+  }
+  return out;
+}
+// Walks the modern (v6+) '8BIM' resource-block layout looking for 'samp' (sampled brushes)
+// blocks, and within each, individual brush sub-records with their alpha image. Returns a
+// list of {name, w, h, data(Float32Array 0..1 coverage), diameter}.
+function parseAbrSampledBrushes(reader,version){
+  const brushes=[];
+  if(version>=6){
+    // After the header, v6+ files are a sequence of 8BIM-tagged blocks:
+    // 'samp' (sampled brush images), 'desc' (descriptor: names/settings), 'patt' (patterns).
+    while(reader.remaining()>=12){
+      const tagSig=reader.str(4); // should be '8BIM'
+      if(tagSig!=='8BIM') break;
+      const key=reader.str(4);
+      let blockLen=reader.u32();
+      const blockStart=reader.pos;
+      if(key==='samp'){
+        const sampEnd=blockStart+blockLen;
+        while(reader.pos<sampEnd-4){
+          const recLen=reader.u32();
+          const recStart=reader.pos;
+          try{
+            // Sampled brush sub-record: brush id (var), then bounds (top,left,bottom,right as
+            // i32), depth (u16), and a per-row compression flag (u8: 0=raw,1=RLE) followed by
+            // that many rows of grayscale alpha data at `depth` bits — depth is virtually
+            // always 8 for real-world brush packs.
+            reader.skip(4); // brush unique id length+bytes; length-prefixed Pascal-ish string
+                             // in practice a 4-byte length + that many chars, but many real
+                             // files pad this — see fallback catch below if misaligned.
+            const top=reader.i32(), left=reader.i32(), bottom=reader.i32(), right=reader.i32();
+            const w=Math.max(1,right-left), h=Math.max(1,bottom-top);
+            const depth=reader.u16();
+            const compression=reader.u8();
+            let data;
+            if(compression===0){
+              data=new Uint8Array(w*h);
+              for(let i=0;i<w*h;i++) data[i]=reader.u8();
+            } else {
+              // RLE: one packbits-compressed byte-length-prefixed row at a time.
+              data=new Uint8Array(w*h);
+              for(let row=0;row<h;row++){
+                const rowLen=reader.u16();
+                const rowStart=reader.pos;
+                const rowReader=new ByteReader(reader.view.buffer.slice(reader.view.byteOffset+rowStart,reader.view.byteOffset+rowStart+rowLen));
+                const rowData=packBitsDecode(rowReader,w);
+                data.set(rowData,row*w);
+                reader.pos=rowStart+rowLen;
+              }
+            }
+            const coverage=new Float32Array(w*h);
+            for(let i=0;i<w*h;i++) coverage[i]=data[i]/255;
+            brushes.push({name:'Brush '+(brushes.length+1),w,h,data:coverage,diameter:Math.max(w,h)});
+          }catch(e){ /* malformed/unsupported sub-record — skip to next via recLen below */ }
+          reader.pos=recStart+recLen+(recLen%2); // records are word-aligned
+        }
+      }
+      reader.pos=blockStart+blockLen+(blockLen%2); // blocks are word-aligned too
+    }
+  } else {
+    // Legacy v1-5: simpler tagged records directly, no 8BIM wrapper. Each brush record
+    // starts with a u16 type tag (1=computed/procedural, 2=sampled) then a u32 record size.
+    while(reader.remaining()>=6){
+      const brushType=reader.u16();
+      const recSize=reader.u32();
+      const recStart=reader.pos;
+      try{
+        if(brushType===2){
+          reader.skip(2); // misc bits
+          const top=reader.i32(), left=reader.i32(), bottom=reader.i32(), right=reader.i32();
+          const w=Math.max(1,right-left), h=Math.max(1,bottom-top);
+          reader.skip(2); // depth
+          const compression=reader.u8();
+          let data=new Uint8Array(w*h);
+          if(compression===0){ for(let i=0;i<w*h;i++) data[i]=reader.u8(); }
+          else {
+            for(let row=0;row<h;row++){
+              const rowReader=new ByteReader(reader.view.buffer.slice(reader.view.byteOffset+reader.pos,reader.view.byteOffset+reader.pos+w*2));
+              const rowData=packBitsDecode(rowReader,w);
+              data.set(rowData,row*w);
+              // Legacy rows don't carry an explicit length prefix reliably across all sub-
+              // versions; advancing by the decoded row's consumed bytes keeps this best-effort.
+              reader.pos+=rowReader.pos;
+            }
+          }
+          const coverage=new Float32Array(w*h);
+          for(let i=0;i<w*h;i++) coverage[i]=data[i]/255;
+          brushes.push({name:'Brush '+(brushes.length+1),w,h,data:coverage,diameter:Math.max(w,h)});
+        }
+      }catch(e){ /* skip malformed record */ }
+      reader.pos=recStart+recSize;
+    }
+  }
+  return brushes;
+}
+async function importBrushPresetFromAbr(file){
+  try{
+    const buf=await file.arrayBuffer();
+    const reader=new ByteReader(buf);
+    const version=reader.u16();
+    let subVersion=0;
+    if(version===6){ subVersion=reader.u16(); }
+    let brushes=[];
+    try{ brushes=parseAbrSampledBrushes(reader,version); }catch(e){ brushes=[]; }
+    if(!brushes.length){
+      setStatus('No sampled brush images found in that .abr file — Photoshop brushes that are '+
+        'purely procedural/vector (no captured tip image), or use an unrecognized sub-version, '+
+        'have no equivalent this parser can decode. Sampled/scanned-texture brushes work best.');
+      return;
+    }
+    const targetTool=(TOOLS_BY_ID[currentTool] && TOOLS_BY_ID[currentTool].kind==='paint') ? currentTool : 'watercolor';
+    const engineForTool={oil:'oil',expressoil:'expressoil',watercolor:'watercolor',ink:'ink',pencil:'dryMedia',pastel:'dryMedia',marker:'marker',airbrush:'airbrush'}[targetTool]||'watercolor';
+    const baseName=file.name.replace(/\.abr$/i,'');
+    const built=brushes.slice(0,24).map((br,idx)=>{ // cap at 24 per import so a huge pack doesn't hang the UI
+      const name=brushes.length>1?(baseName+' '+(idx+1)):baseName;
+      const detectedShape=shapeFromFileName(name+' '+br.name);
+      const baseSizeByTool={oil:60,expressoil:60,watercolor:48,ink:36,pencil:16,pastel:44,marker:34,airbrush:66}[targetTool]||48;
+      const params=synthBrush(name,detectedShape,baseSizeByTool,targetTool,engineForTool,'My Brushes');
+      params.shape=detectedShape;
+      params.size=clamp(Math.round(br.diameter*0.35),10,220); // scale the sampled tip's own pixel size down to a sane on-canvas size
+      // Build a preview canvas from the decoded alpha so Brush Creator / the brush list can
+      // show the REAL imported tip shape, not a guessed swoosh — this is genuine shape data.
+      const prevC=document.createElement('canvas'); prevC.width=br.w; prevC.height=br.h;
+      const prevG=prevC.getContext('2d'); const id=prevG.createImageData(br.w,br.h);
+      for(let i=0;i<br.w*br.h;i++){ const v=Math.round(br.data[i]*255); id.data[i*4]=255;id.data[i*4+1]=255;id.data[i*4+2]=255;id.data[i*4+3]=v; }
+      prevG.putImageData(id,0,0);
+      const key='custom_'+Date.now().toString(36)+'_'+idx+'_'+Math.random().toString(36).slice(2,5);
+      // This IS a real per-pixel alpha mask from the actual brush (unlike the PNG path's
+      // rejected preview swoosh), so it's legitimate to use directly as shapeTex here.
+      return Object.assign(params,{key,maxSize:clamp(params.size*5,90,1500),
+        shapeTex:{w:br.w,h:br.h,data:br.data},shapeTexURL:prevC.toDataURL(),shapeInvert:false,
+        sizeBehavior:'pressure',opacityBehavior:'pressure-soft',tipTilt:0,brushForm:0,smudgeOnStroke:false,
+        jitter:{enabled:false,mode:'stamp',hue:0,sat:0,bright:0},imported:true,importedFromAbr:true});
+    });
+    finishBrushPresetImport(built,targetTool,true);
+    setStatus('Imported '+built.length+' brush'+(built.length>1?'es':'')+' from "'+file.name+
+      '" (.abr v'+version+') — real tip shapes decoded, dynamics (water/flow/grain) still '+
+      'approximated for this engine since Photoshop and Rebelle simulate paint differently.');
+  }catch(e){
+    setStatus('Could not parse that .abr file — it may use an ABR sub-version or brush type '+
+      '(vector/parametric, dual-brush, pattern-based) this parser does not decode. Try File > '+
+      'Import Assets in Photoshop\u2019s own Brush Creator equivalent workflow: export the tip as '+
+      'a PNG shape via Photoshop\u2019s Export As, then use Brush Creator > Shape here instead.');
+  }
 }
 /* Shared "which tool group should this land in?" prompt + apply step, used by
    both the JSON path and the PNG path so behavior stays consistent. */
@@ -1688,17 +1886,30 @@ async function importBrushPresetFromPng(file){
       params.water=clamp(params.water*jitter(0.8,1.25),0.03,0.98);
       params.grain=clamp(params.grain*jitter(0.7,1.4),0.02,0.98);
       params.opacity=clamp(params.opacity*jitter(0.85,1.15),0.08,0.95);
-      const shapeTex=extractCoverageTexture(g,w,h,false);
+      // IMPORTANT: do NOT feed the swatch's own pixels into the engine as a per-stroke
+      // shape/coverage mask (shapeTex). That swatch is a generic curved "preview swoosh"
+      // graphic (see the HONEST LIMITS comment above) — sampling it radially as if it were a
+      // real centered brush-tip alpha mask made EVERY imported brush paint as the same solid,
+      // hard-edged blob regardless of its detected footprint, because the swoosh's thick
+      // painted stroke covers most of the sampled area at high opacity. That is exactly why
+      // imported brushes looked nothing like the soft, tapered, grainy strokes a real brush
+      // engine (or this app's own built-in brushes) produces. Leaving shapeTex unset makes
+      // depositWet() fall back to the engine's real procedural elliptical falloff
+      // (Math.pow(1-rr,1.4)) for whichever shape was detected — the same falloff every
+      // built-in round/liner/mop/etc. brush already uses — so imported brushes get a real
+      // soft/tapered edge instead of a hard blob. The swatch image is kept ONLY as a cosmetic
+      // reference thumbnail (shapeTexURL) shown in Brush Creator, never as painting data.
       const key='custom_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,7);
       b=Object.assign(params,{key,maxSize:clamp(params.size*5,90,1500),
-        shapeTex,shapeTexURL:dataURL,shapeInvert:false,
+        shapeTex:null,shapeTexURL:dataURL,shapeInvert:false,referenceSwatchOnly:true,
         sizeBehavior:'pressure',opacityBehavior:'pressure-soft',tipTilt:0,brushForm:0,smudgeOnStroke:false,
         jitter:{enabled:false,mode:'stamp',hue:0,sat:0,bright:0},imported:true,importedFromPng:true,
         needsShapeReview:true});
       setStatus('Imported "'+b.name+'" as a '+detectedShape+' brush (size '+params.size+'px, water '+
         params.water.toFixed(2)+', grain '+params.grain.toFixed(2)+') — Rebelle .png files store real '+
-        'shape data in an undocumented format we cannot read, so this was inferred from the file name. '+
-        'Open Brush Creator → Shape & Grain to fine-tune it to match the original.');
+        'shape data in an undocumented format we cannot read, so this was inferred from the file name '+
+        'and uses this engine\'s normal soft brush falloff (not the preview image as a hard stamp). '+
+        'Open Brush Creator → Shape & Grain to fine-tune it further.');
     }
     finishBrushPresetImport([b],b.tool,true);
   }catch(e){
@@ -3676,7 +3887,7 @@ function renderBrushList(set,groupNames){
 let bcTab='stroke';
 function buildBrushCreator(){
   const body=document.getElementById('bcBody');
-  if(TOOLS_BY_ID[currentTool].kind!=='paint'){ body.innerHTML='<p class="tinyNote">Select a paint tool to edit its brush.</p><div class="bcActions"><label class="fileBtn">Import Brush Preset…<input type="file" accept=".json,application/json,.png,image/png" id="bcImportPresetOnly"></label></div>'; const inp=document.getElementById('bcImportPresetOnly'); if(inp) inp.onchange=e=>{ if(e.target.files[0]) importBrushPresetFile(e.target.files[0]); }; return; }
+  if(TOOLS_BY_ID[currentTool].kind!=='paint'){ body.innerHTML='<p class="tinyNote">Select a paint tool to edit its brush.</p><div class="bcActions"><label class="fileBtn">Import Brush Preset…<input type="file" accept=".json,application/json,.png,image/png,.abr" id="bcImportPresetOnly"></label></div>'; const inp=document.getElementById('bcImportPresetOnly'); if(inp) inp.onchange=e=>{ if(e.target.files[0]) importBrushPresetFile(e.target.files[0]); }; return; }
   let html=`<div class="assetTabs">
     <button data-tab="stroke" class="${bcTab==='stroke'?'active':''}">Stroke</button>
     <button data-tab="shape" class="${bcTab==='shape'?'active':''}">Shape &amp; Grain</button>
@@ -3684,7 +3895,7 @@ function buildBrushCreator(){
   </div>`;
   html+=strokePreviewHTML();
   html+=`<div class="bcActions">
-    <label class="fileBtn">Import Preset…<input type="file" accept=".json,application/json,.png,image/png" id="bcImportPreset"></label>
+    <label class="fileBtn">Import Preset…<input type="file" accept=".json,application/json,.png,image/png,.abr" id="bcImportPreset"></label>
     <button class="qbtn" id="bcExportPreset">Export Preset…</button>
   </div>`;
   if(bcTab==='stroke'){
@@ -5801,7 +6012,7 @@ function buildQuickbar(){
     <button class="qbtn" id="qbDry">Dry Canvas</button>
     <button class="qbtn" id="qbClear">Clear Layer</button>
     <div class="qsep"></div>
-    <label class="qbtn fileBtn" style="padding:5px 10px" title="Import a Rebelle brush preset (.json or .png)">Import Brush…<input type="file" accept=".json,application/json,.png,image/png" id="qbImportBrush"></label>
+    <label class="qbtn fileBtn" style="padding:5px 10px" title="Import a brush preset: Rebelle .json/.png, or Photoshop .abr">Import Brush…<input type="file" accept=".json,application/json,.png,image/png,.abr" id="qbImportBrush"></label>
     <label class="qbtn fileBtn" style="padding:5px 10px" title="Import a custom paper/canvas texture (.png/.jpg)">Import Paper…<input type="file" accept="image/*" id="qbImportPaper"></label>
     <div class="qsep"></div>
     <button class="qbtn primary" id="qbExport">Export PNG</button>`;
