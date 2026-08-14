@@ -2445,7 +2445,19 @@ function sampleTexTiled(tex,worldX,worldY,scale){
 // everything looks hard/solid" bug.
 function pigmentApproachIncrement(old,amount,plateau){
   const cap=plateau!=null?plateau:1.55;
-  const rate=clamp(amount*2.6,0,1);
+  // BUG FIX: `amount*2.6` let a single dab's rate hit the 0..1 clamp ceiling whenever
+  // amount>=~0.385 — which is well inside the range of perfectly normal high-opacity dry
+  // media (charcoal, dense pencil, marker) values like opacity=0.72*flow=0.75~=0.5+. Once
+  // rate=1, a SINGLE stamp fully saturates pd to the plateau in one touch, before texture,
+  // grain, or pressure ever get a chance to create visible per-pixel variation across a
+  // stroke — that's what produced flat, textureless "solid blob" strokes for every brush
+  // whose opacity*flow combination crossed that threshold, regardless of its grain/shape
+  // settings. Softening the curve (dividing by a higher constant + clamping the exponent
+  // itself, not just the final rate) means even strong dry-media brushes build up density
+  // gradually across several overlapping dabs — which is also physically closer to how a
+  // real pencil/charcoal stroke actually darkens with repeated passes — while still reaching
+  // full saturation within a normal stroke length for high-pressure/high-opacity brushes.
+  const rate=1-Math.pow(1-clamp(amount*1.1,0,1),1.6);
   return (cap-old)*rate;
 }
 /* ---------- deposit: wet media (watercolor / ink / dryMedia / marker / airbrush) ---------- */
@@ -2479,6 +2491,16 @@ function depositWet(L,x,y,pressure,angle,speed,b,bias){
     if(amount<=0.0008) return;
     const old=L.pd[i];
     if(L.lockAlpha && old<=0.002) return; // Lock Transparency: never paint onto empty pixels
+    // BUG FIX: grain previously only changed how FAST a pixel's density approached the
+    // plateau, not the plateau itself — so after enough overlapping dabs (normal for any
+    // real stroke of more than a few pixels long), every pixel converged to the SAME final
+    // density regardless of grain, permanently erasing the texture pattern and leaving a
+    // flat, solid-colored blob. Real dry-media grain works because paper tooth physically
+    // holds less pigment in the valleys and more on the peaks — that's a ceiling difference,
+    // not just a speed difference. Scaling the plateau itself by tooth (for grainy brushes)
+    // means the texture pattern survives indefinitely, however long the stroke/however many
+    // times it's re-stroked, instead of washing out to solid coverage.
+    const grainCeilingMul = grainAmt>0.02 ? lerp(1-grainAmt*0.55, 1, tooth) : 1;
     const preWet=L.wet[i]; // wetness already on the paper BEFORE this stamp — drives instant bloom below
     // Pixels with ~zero prior coverage have no meaningful stored color (buffers default to
     // black). Treat such pixels as if their "old color" were the new paint color itself,
@@ -2488,17 +2510,17 @@ function depositWet(L,x,y,pressure,angle,speed,b,bias){
     if(mode==='paint' && bias.subtractive){
       const a=clamp(amount*1.8,0,1);
       L.pr[i]=lerp(oR,col.r,a); L.pg[i]=lerp(oG,col.g,a); L.pb[i]=lerp(oB,col.b,a);
-      L.pd[i]=clamp(old+pigmentApproachIncrement(old,amount,1.5),0,2.4);
+      L.pd[i]=clamp(old+pigmentApproachIncrement(old,amount,1.5*grainCeilingMul),0,2.4);
     } else if(bias.flatCap){
-      if(amount>old*0.4){ L.pr[i]=col.r; L.pg[i]=col.g; L.pb[i]=col.b; L.pd[i]=clamp(old+pigmentApproachIncrement(old,amount,2.2),0,2.2); }
+      if(amount>old*0.4){ L.pr[i]=col.r; L.pg[i]=col.g; L.pb[i]=col.b; L.pd[i]=clamp(old+pigmentApproachIncrement(old,amount,2.2*grainCeilingMul),0,2.2); }
     } else if(bias.subtractive && b.mixingMode==='opaque'){
       // Opaque (gouache-like): dense, flat color coverage rather than glazing through.
       const a=clamp(amount*2.2,0,1);
       L.pr[i]=lerp(oR,col.r,a); L.pg[i]=lerp(oG,col.g,a); L.pb[i]=lerp(oB,col.b,a);
-      L.pd[i]=clamp(old+pigmentApproachIncrement(old,amount,2.4),0,2.4);
+      L.pd[i]=clamp(old+pigmentApproachIncrement(old,amount,2.4*grainCeilingMul),0,2.4);
     } else if(bias.subtractive && b.mixingMode==='semitransparent'){
       // Midpoint: subtractive glazing blended with a direct opacity-driven mix.
-      const total=old+pigmentApproachIncrement(old,amount,1.8)+1e-6;
+      const total=old+pigmentApproachIncrement(old,amount,1.8*grainCeilingMul)+1e-6;
       const subR=255-((255-oR)*old+(255-col.r)*amount)/total, subG=255-((255-oG)*old+(255-col.g)*amount)/total, subB=255-((255-oB)*old+(255-col.b)*amount)/total;
       const a=clamp(amount*1.5,0,1);
       const opR=lerp(oR,col.r,a), opG=lerp(oG,col.g,a), opB=lerp(oB,col.b,a);
@@ -2508,12 +2530,12 @@ function depositWet(L,x,y,pressure,angle,speed,b,bias){
     } else if(bias.subtractive && pigmentMixing){
       // Real Pigment Color Mixing: mix in approximate RYB pigment space instead of the RGB
       // complement, so e.g. yellow+blue trends toward green like actual paint, not gray-brown.
-      const total=old+pigmentApproachIncrement(old,amount,1.5)+1e-6, t=clamp((total-old)/total,0,1);
+      const total=old+pigmentApproachIncrement(old,amount,1.5*grainCeilingMul)+1e-6, t=clamp((total-old)/total,0,1);
       const mixed=mixNaturalRGB(oR,oG,oB,colRyb,t);
       L.pr[i]=mixed.r; L.pg[i]=mixed.g; L.pb[i]=mixed.b;
       L.pd[i]=clamp(total,0,2.4);
     } else if(bias.subtractive){
-      const total=old+pigmentApproachIncrement(old,amount,1.5)+1e-6;
+      const total=old+pigmentApproachIncrement(old,amount,1.5*grainCeilingMul)+1e-6;
       const t=(total-old)/total;
       L.pr[i]=255-((255-oR)*(1-t)+(255-col.r)*t);
       L.pg[i]=255-((255-oG)*(1-t)+(255-col.g)*t);
@@ -2522,7 +2544,7 @@ function depositWet(L,x,y,pressure,angle,speed,b,bias){
     } else {
       const a=clamp(amount,0,1);
       L.pr[i]=oR*(1-a)+col.r*a; L.pg[i]=oG*(1-a)+col.g*a; L.pb[i]=oB*(1-a)+col.b*a;
-      L.pd[i]=clamp(old+pigmentApproachIncrement(old,amount,1.5),0,2.4);
+      L.pd[i]=clamp(old+pigmentApproachIncrement(old,amount,1.5*grainCeilingMul),0,2.4);
     }
     if(bias.waterMul>0){
       const addW=b.water*bias.waterMul*fall*(1-absorbMap[i]*(V.absorbency/10)*0.5);
@@ -2587,15 +2609,29 @@ function depositOil(L,x,y,pressure,angle,speed,b){
     forEachInDab(bx,by,r,r*(b.shape==='knife'?0.55:1),angle,1,(px,py,i,rr)=>{
       if(!inSelection(px,py)) return;
       const st=stencilAlpha(px,py); if(st<=0.02) return;
-      const fall=1-rr, tooth=toothMap[i];
+      const fall=1-rr;
+      // BUG FIX: this used to always read the PAPER's own tooth texture and completely
+      // ignore b.grainTex — so any oil/bristle brush built with a custom grain texture
+      // (chisel streaks, coarse sponge, etc.) painted with that texture totally invisible,
+      // contributing to every oil-engine brush looking like a flat, textureless blob
+      // regardless of its grain setting. Same fix as depositWet(): blend in the brush's own
+      // grain texture (tiled to world space) when it has one, exactly like the wet-media path.
+      const tooth=b.grainTex ? lerp(toothMap[i],sampleTexTiled(b.grainTex,px,py,Math.max(4,size*0.5)),0.7) : toothMap[i];
+      const grainAmt2=b.grain*(0.4+V.textureInfluence/10);
       let amount=amountBase*fall*(0.7+0.3*tooth)*st;
       if(amount<=0.0006) return;
       if(L.lockAlpha && L.pd[i]<=0.002) return;
+      // Same "grain sets a ceiling, not just a speed" fix as depositWet(): without this, the
+      // oil engine's per-dab additive buildup (L.pd[i]+amount*0.5) still eventually washes
+      // every pixel to the same coverage regardless of tooth once a stroke is passed over
+      // enough times, which is what erased grain texture in oils just as it did in wet media.
+      const grainCeilingMul2 = grainAmt2>0.02 ? lerp(1-grainAmt2*0.55, 1, tooth) : 1;
       const mixT = mode==='paint' ? Math.min(0.94,fall*0.92) : clamp(0.22+0.65*oili,0,0.95)*fall;
       const hadColor=L.pd[i]>0.01;
       const oR=hadColor?L.pr[i]:col.r, oG=hadColor?L.pg[i]:col.g, oB=hadColor?L.pb[i]:col.b;
       L.pr[i]=lerp(oR,col.r,mixT); L.pg[i]=lerp(oG,col.g,mixT); L.pb[i]=lerp(oB,col.b,mixT);
-      L.pd[i]=clamp(L.pd[i]+amount*0.5,0,2.6);
+      const pdCeiling=2.6*grainCeilingMul2;
+      L.pd[i]=clamp(Math.min(L.pd[i]+amount*0.5,pdCeiling),0,2.6);
       L.height[i]=clamp(L.height[i]+amount*b.pigment*(V.impastoDepth/10)*(b.shape==='knife'?1.7:1)*fall,0,3.2);
     });
   });
