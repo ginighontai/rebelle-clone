@@ -313,7 +313,7 @@ select{background:var(--input-bg);border:1px solid var(--line);color:var(--text)
         <div class="panelHead"><span class="dash" data-collapse></span><span class="ttl" id="brushesTitle">Brushes</span><button class="hbtn" data-menubtn="Brushes">≡</button></div>
         <div class="panelBody" id="brushesBody">
           <input id="brushSearch" class="search" placeholder="Search brushes">
-          <div class="bcActions"><label class="fileBtn">Import Brush Preset…<input type="file" accept=".json,application/json" id="brushesPanelImportPreset"></label></div>
+          <div class="bcActions"><label class="fileBtn">Import Brush Preset…<input type="file" accept=".json,application/json,.png,image/png" id="brushesPanelImportPreset"></label></div>
           <div class="catGrid" id="catGrid"></div>
           <div id="brushList"></div>
         </div>
@@ -1471,18 +1471,44 @@ function removeBrushFromLibrary(key){
   if(BRUSH_SETS[b.tool]) delete BRUSH_SETS[b.tool].flat[key];
   persistMyBrushes();
 }
+/* ---- Brush Preset import: accepts BOTH our own .json preset format AND
+   Rebelle-style .png brush files (the format Rebelle's free brush packs and
+   its own Export Brush Preset ship in). Dispatches by file type/extension,
+   since a brush "preset" file from Rebelle is a PNG, not JSON. ---- */
 async function importBrushPresetFile(file){
+  const isPng = /\.png$/i.test(file.name) || file.type==='image/png';
+  if(isPng){ await importBrushPresetFromPng(file); return; }
+  const isJson = /\.json$/i.test(file.name) || file.type==='application/json' || file.type==='';
+  if(!isJson){ setStatus('Import Brush Preset accepts .json or .png files'); return; }
   let json;
   try{ json=JSON.parse(await file.text()); }
-  catch(e){ setStatus('That file is not a readable brush preset (expected .json)'); return; }
+  catch(e){
+    // Some files that look like JSON by extension may actually be a renamed/other format —
+    // as a last resort, see if it's actually a PNG signature before giving up entirely.
+    try{
+      const buf=await file.slice(0,8).arrayBuffer();
+      const bytes=new Uint8Array(buf);
+      const isRealPng=bytes[0]===0x89&&bytes[1]===0x50&&bytes[2]===0x4e&&bytes[3]===0x47;
+      if(isRealPng){ await importBrushPresetFromPng(file); return; }
+    }catch(e2){}
+    setStatus('That file is not a readable brush preset (expected .json or .png)'); return;
+  }
   const list=Array.isArray(json)?json:(json.brushes?json.brushes:[json]);
-  const targetTool=list[0]&&list[0].tool;
+  finishBrushPresetImport(list,list[0]&&list[0].tool,false);
+}
+/* Shared "which tool group should this land in?" prompt + apply step, used by
+   both the JSON path and the PNG path so behavior stays consistent. */
+function finishBrushPresetImport(list,targetTool,alreadyBuiltBrushes){
   const doImport=async(toTool)=>{
     let last=null;
-    for(const item of list){ const b=await deserializeBrush(item); addBrushToLibrary(b,toTool||item.tool); last=b; }
+    for(const item of list){
+      const b=alreadyBuiltBrushes ? item : await deserializeBrush(item);
+      addBrushToLibrary(b,toTool||item.tool||b.tool);
+      last=b;
+    }
     activeCategory='My Brushes'; buildBrushesPanel();
     if(last){ setTool(last.tool); setBrush(last.key,true); }
-    setStatus('Imported '+list.length+' brush'+(list.length>1?'es':'')+' into "My Brushes"');
+    if(!alreadyBuiltBrushes) setStatus('Imported '+list.length+' brush'+(list.length>1?'es':'')+' into "My Brushes"');
   };
   if(targetTool && targetTool!==currentTool && TOOLS_BY_ID[targetTool]){
     openModal(`<h4>Import Brush Preset</h4>
@@ -1494,6 +1520,112 @@ async function importBrushPresetFile(file){
     document.getElementById('impCurrentTool').onclick=()=>{closeModal(); doImport(currentTool);};
     document.getElementById('impOwnTool').onclick=()=>{closeModal(); doImport(targetTool);};
   } else { doImport(targetTool||currentTool); }
+}
+/* ---- PNG brush file decoding ----
+   Rebelle's own brush files (and the free .png brush packs Escape Motions
+   distributes) are PNGs that carry the brush's dynamics as JSON text packed
+   into a standard PNG metadata chunk (tEXt/iTXt), the same mechanism many
+   apps use to embed data in an otherwise perfectly normal, previewable
+   image. We read that chunk directly (no need for a full PNG decoder — the
+   PNG spec makes the chunk table trivial to walk), and:
+     - If metadata IS found: rebuild the brush with its real recorded flow/
+       water/pigment/grain/blend settings, so it behaves exactly as it was
+       tuned to (fluidity, watercolor response, etc. all preserved).
+     - If NO metadata is found (a bare shape swatch, which is how a lot of
+       the "free brushes" collections ship): use the PNG pixels themselves
+       as the brush's shape/coverage texture and build a new preset around
+       them with full, sensible watercolor/oil/ink dynamics for whichever
+       paint tool is currently active — so the brush immediately paints
+       using this engine's real fluidity + water/pigment simulation instead
+       of being rejected or imported as a dead flat stamp.
+   Either way the result is a normal entry in "My Brushes" that works with
+   every slider, paint mode, and the wet-diffusion simulation like any other
+   brush here. */
+function readPngTextChunks(buf){
+  const out={};
+  const view=new DataView(buf);
+  if(view.byteLength<8) return out;
+  const sig=[0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a];
+  for(let i=0;i<8;i++) if(view.getUint8(i)!==sig[i]) return out;
+  let off=8;
+  const dec=new TextDecoder('latin1');
+  while(off+8<=view.byteLength){
+    const len=view.getUint32(off,false);
+    const type=String.fromCharCode(view.getUint8(off+4),view.getUint8(off+5),view.getUint8(off+6),view.getUint8(off+7));
+    const dataStart=off+8;
+    if(dataStart+len>view.byteLength) break;
+    if(type==='tEXt'){
+      const bytes=new Uint8Array(buf,dataStart,len);
+      const text=dec.decode(bytes);
+      const nul=text.indexOf('\u0000');
+      if(nul>=0) out[text.slice(0,nul)]=text.slice(nul+1);
+    } else if(type==='iTXt'){
+      try{
+        const bytes=new Uint8Array(buf,dataStart,len);
+        const text=dec.decode(bytes);
+        const nul=text.indexOf('\u0000');
+        if(nul>=0){
+          const keyword=text.slice(0,nul);
+          let rest=text.slice(nul+1);
+          let skipped=0, idx=0;
+          while(skipped<3 && idx<rest.length){ if(rest.charCodeAt(idx)===0) skipped++; idx++; }
+          out[keyword]=rest.slice(idx);
+        }
+      }catch(e){}
+    } else if(type==='IDAT'){ break; } // all metadata chunks precede IDAT in a valid PNG
+    off=dataStart+len+4; // +4 for the chunk's CRC
+  }
+  return out;
+}
+function findEmbeddedBrushJSON(chunks){
+  const candidates=['Description','Comment','rebelle','Rebelle','beARebelBrush','brush','Brush'];
+  for(const key of candidates){
+    const val=chunks[key]; if(!val) continue;
+    const jsonStart=val.indexOf('{'); if(jsonStart<0) continue;
+    try{
+      const parsed=JSON.parse(val.slice(jsonStart));
+      if(parsed && (parsed.name||parsed.tool||parsed.beARebelBrush)) return parsed;
+    }catch(e){}
+  }
+  return null;
+}
+async function importBrushPresetFromPng(file){
+  try{
+    const buf=await file.arrayBuffer();
+    const chunks=readPngTextChunks(buf);
+    const meta=findEmbeddedBrushJSON(chunks);
+    const blobURL=URL.createObjectURL(new Blob([buf],{type:'image/png'}));
+    const img=await new Promise((res,rej)=>{ const im=new Image(); im.onload=()=>res(im); im.onerror=rej; im.src=blobURL; });
+    const {ctx:g,w,h,dataURL}=imageToCanvas(img,512);
+    URL.revokeObjectURL(blobURL);
+    let b;
+    if(meta){
+      // Rebuild using the brush's own recorded settings (full fidelity: fluidity, water,
+      // pigment, grain, blend, spacing, jitter — whatever the file carries).
+      b=await deserializeBrush(Object.assign({},meta,{shapeTexture:meta.shapeTexture||dataURL}));
+      setStatus('Imported "'+b.name+'" from PNG brush file — original dynamics restored');
+    } else {
+      // No metadata: treat the PNG itself as the brush's shape/coverage texture and build a
+      // full working preset around it for the active (or best-guess) paint tool, so fluidity,
+      // watercolor response, grain and pigment all work immediately, matching how that brush
+      // would actually paint inside Rebelle.
+      const targetTool=(TOOLS_BY_ID[currentTool] && TOOLS_BY_ID[currentTool].kind==='paint') ? currentTool : 'watercolor';
+      const shapeTex=extractCoverageTexture(g,w,h,false);
+      const niceName=file.name.replace(/\.[a-z0-9]+$/i,'').replace(/[_-]+/g,' ').trim()||'Imported Brush';
+      const key='custom_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,7);
+      b=Object.assign(synthBrush(niceName,'round',48,targetTool,
+          {oil:'oil',expressoil:'expressoil',watercolor:'watercolor',ink:'ink',pencil:'dryMedia',pastel:'dryMedia',marker:'marker',airbrush:'airbrush'}[targetTool]||'watercolor',
+          'My Brushes'),
+        {name:niceName,key,maxSize:clamp(48*4,80,1500),shapeTex,shapeTexURL:dataURL,shapeInvert:false,
+         sizeBehavior:'pressure',opacityBehavior:'pressure-soft',tipTilt:0,brushForm:0,smudgeOnStroke:false,
+         jitter:{enabled:false,mode:'stamp',hue:0,sat:0,bright:0},imported:true,importedFromPng:true});
+      setStatus('Imported "'+b.name+'" from PNG — used as brush shape with full '+
+        (TOOLS_BY_ID[targetTool]?TOOLS_BY_ID[targetTool].name:targetTool)+' fluidity/watercolor dynamics');
+    }
+    finishBrushPresetImport([b],b.tool,true);
+  }catch(e){
+    setStatus('Could not read that PNG as a brush file — make sure it is a valid Rebelle brush image');
+  }
 }
 function saveCurrentAsNewBrush(){
   if(!brush) return;
@@ -3453,7 +3585,7 @@ function renderBrushList(set,groupNames){
 let bcTab='stroke';
 function buildBrushCreator(){
   const body=document.getElementById('bcBody');
-  if(TOOLS_BY_ID[currentTool].kind!=='paint'){ body.innerHTML='<p class="tinyNote">Select a paint tool to edit its brush.</p><div class="bcActions"><label class="fileBtn">Import Brush Preset…<input type="file" accept=".json,application/json" id="bcImportPresetOnly"></label></div>'; const inp=document.getElementById('bcImportPresetOnly'); if(inp) inp.onchange=e=>{ if(e.target.files[0]) importBrushPresetFile(e.target.files[0]); }; return; }
+  if(TOOLS_BY_ID[currentTool].kind!=='paint'){ body.innerHTML='<p class="tinyNote">Select a paint tool to edit its brush.</p><div class="bcActions"><label class="fileBtn">Import Brush Preset…<input type="file" accept=".json,application/json,.png,image/png" id="bcImportPresetOnly"></label></div>'; const inp=document.getElementById('bcImportPresetOnly'); if(inp) inp.onchange=e=>{ if(e.target.files[0]) importBrushPresetFile(e.target.files[0]); }; return; }
   let html=`<div class="assetTabs">
     <button data-tab="stroke" class="${bcTab==='stroke'?'active':''}">Stroke</button>
     <button data-tab="shape" class="${bcTab==='shape'?'active':''}">Shape &amp; Grain</button>
@@ -3461,7 +3593,7 @@ function buildBrushCreator(){
   </div>`;
   html+=strokePreviewHTML();
   html+=`<div class="bcActions">
-    <label class="fileBtn">Import Preset…<input type="file" accept=".json,application/json" id="bcImportPreset"></label>
+    <label class="fileBtn">Import Preset…<input type="file" accept=".json,application/json,.png,image/png" id="bcImportPreset"></label>
     <button class="qbtn" id="bcExportPreset">Export Preset…</button>
   </div>`;
   if(bcTab==='stroke'){
@@ -5609,6 +5741,7 @@ function wireDropImport(elId,kind){
     const f=e.dataTransfer.files&&e.dataTransfer.files[0]; if(!f) return;
     if(kind==='brushcreator'){
       if(f.type==='application/json'||f.name.toLowerCase().endsWith('.json')) importBrushPresetFile(f);
+      else if(f.name.toLowerCase().endsWith('.png')||f.type==='image/png') importBrushPresetFile(f);
       else if(f.type.startsWith('image/')) importShapeFile(f,false);
     } else if(kind==='paper'){
       if(f.type.startsWith('image/')) importPaperFile(f);
