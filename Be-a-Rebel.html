@@ -1589,6 +1589,109 @@ function findEmbeddedBrushJSON(chunks){
   }
   return null;
 }
+/* =========================================================================
+   PNG BRUSH SHAPE ANALYSIS
+   Real Rebelle brushes differ from each other because their actual tip
+   shape, edge softness, and coverage density differ. A brush imported from
+   a bare shape-swatch PNG (no embedded metadata) needs those same real
+   differences derived from its OWN pixels — not a fixed 'round' shape with
+   fixed numbers, which is why two different swatches previously painted
+   identically. This walks the swatch's coverage mask and computes:
+     - aspect ratio & density of its bounding shape (round vs. elongated
+       vs. flat vs. sparse/scattered)
+     - fragment count via connected-component labeling (a tight single
+       blob vs. a scattered cluster of bristles/spatter/leaves)
+     - edge softness (hard-edged ink shape vs. soft feathered wash)
+     - local texture roughness (smooth vs. grainy coverage)
+   and maps those to one of the engine's existing footprint shapes
+   (round/mop/filbert/flat/liner/grunge/splat) plus real, differing
+   flow/water/grain/pigment/opacity/spacing values — so two different
+   brush PNGs come out as two genuinely different, independently-tunable
+   brushes, matching how Rebelle's own brush library behaves. */
+function analyzeBrushPngShape(ctx,w,h){
+  const id=ctx.getImageData(0,0,w,h).data;
+  let alphaVaries=false; const firstA=id[3];
+  for(let p=3;p<id.length;p+=4){ if(Math.abs(id[p]-firstA)>6){ alphaVaries=true; break; } }
+  const cov=new Float32Array(w*h);
+  for(let i=0,p=0;i<w*h;i++,p+=4){
+    const lum=(id[p]*0.299+id[p+1]*0.587+id[p+2]*0.114)/255;
+    const a=id[p+3]/255;
+    cov[i]=alphaVaries?a:(1-lum);
+  }
+  const ON=0.15;
+  let minx=w,maxx=-1,miny=h,maxy=-1,onCount=0,softCount=0,covSum=0;
+  for(let y=0;y<h;y++)for(let x=0;x<w;x++){
+    const v=cov[y*w+x];
+    if(v>ON){ onCount++; covSum+=v; if(x<minx)minx=x; if(x>maxx)maxx=x; if(y<miny)miny=y; if(y>maxy)maxy=y;
+      if(v>ON+0.03 && v<0.85) softCount++; }
+  }
+  if(onCount===0) return {shape:'round',aspect:1,density:.5,fragments:1,softFraction:.3,roughness:.2,coverageMean:.5};
+  const bw=Math.max(1,maxx-minx+1), bh=Math.max(1,maxy-miny+1);
+  const aspect=Math.max(bw,bh)/Math.max(1,Math.min(bw,bh));
+  const density=onCount/(bw*bh);
+  const softFraction=softCount/onCount;
+  const coverageMean=covSum/onCount;
+  // Connected-component count (4-neighbor flood fill) tells us "one solid tip" vs.
+  // "a scattered cluster of separate marks" (bristle spray, spatter, leaf clusters, etc.)
+  const visited=new Uint8Array(w*h);
+  let fragments=0;
+  const stack=[];
+  for(let y=miny;y<=maxy;y++)for(let x=minx;x<=maxx;x++){
+    const i=y*w+x;
+    if(visited[i]||cov[i]<=ON) continue;
+    fragments++;
+    stack.push(i);
+    while(stack.length){
+      const j=stack.pop(); if(visited[j]) continue; visited[j]=1;
+      if(cov[j]<=ON) continue;
+      const jx=j%w, jy=(j/w)|0;
+      if(jx>minx) stack.push(j-1); if(jx<maxx) stack.push(j+1);
+      if(jy>miny) stack.push(j-w); if(jy<maxy) stack.push(j+w);
+    }
+    if(fragments>60) break; // cap — beyond this it's simply "very scattered", no need to keep counting
+  }
+  // Local roughness: average abs difference between neighboring coverage samples inside
+  // the bounding box — a smooth soft blob scores low, a grainy/textured swatch scores high.
+  let roughSum=0,roughN=0;
+  for(let y=miny;y<maxy;y+=2)for(let x=minx;x<maxx;x+=2){
+    const i=y*w+x; if(cov[i]<=ON) continue;
+    roughSum+=Math.abs(cov[i]-cov[i+1])+Math.abs(cov[i]-cov[i+w]); roughN++;
+  }
+  const roughness=roughN?clamp((roughSum/roughN)*2.2,0,1):0.15;
+  let shape='round';
+  if(fragments>=5 && density<0.22) shape='splat';
+  else if(fragments>=3 && density<0.42) shape='grunge';
+  else if(aspect>=3.2) shape='liner';
+  else if(aspect>=1.9) shape='flat';
+  else if(aspect>=1.35) shape='filbert';
+  else if(density<0.5) shape='mop';
+  else shape='round';
+  return {shape,aspect,density,fragments,softFraction,roughness,coverageMean,bw,bh};
+}
+// Cheap deterministic hash of the coverage pixels so two visually-different swatches never
+// collapse onto identical numeric parameters even within the same shape category, while two
+// imports of the exact same file still get the exact same (reproducible) result.
+function hashCoverage(ctx,w,h){
+  const id=ctx.getImageData(0,0,w,h).data;
+  let h1=2166136261;
+  for(let i=0;i<id.length;i+=17){ h1=(h1^id[i])>>>0; h1=Math.imul(h1,16777619)>>>0; }
+  return (h1>>>0)/4294967295; // 0..1
+}
+function brushParamsFromPngAnalysis(a,seed,baseSize){
+  const j=(lo,hi)=>lo+(hi-lo)*seed; // deterministic per-image "jitter" inside a real range
+  const bySize={round:baseSize,mop:baseSize*1.5,filbert:baseSize*1.1,flat:baseSize*1.15,
+    liner:baseSize*0.55,grunge:baseSize*1.25,splat:baseSize*1.05}[a.shape]||baseSize;
+  const size=clamp(Math.round(bySize*j(0.85,1.2)),10,220);
+  const water=clamp(0.18+a.softFraction*0.55+j(-0.05,0.08),0.05,0.95);
+  const grain=clamp(a.roughness*0.75+j(0,0.12),0.03,0.95);
+  const pigment=clamp(0.1+a.coverageMean*0.7+j(-0.05,0.08),0.05,0.95);
+  const opacity=clamp(0.32+a.coverageMean*0.45+j(-0.06,0.08),0.15,0.92);
+  const flow=clamp(0.4+a.density*0.35+j(-0.05,0.1),0.15,0.95);
+  const blend={mop:0.5,filbert:0.36,round:0.3,flat:0.28,liner:0.2,grunge:0.16,splat:0.14}[a.shape]||0.3;
+  const spacing={liner:6,round:10,filbert:11,flat:12,mop:15,grunge:16,splat:18}[a.shape]||12;
+  return {shape:a.shape,size,maxSize:clamp(size*5,90,1500),opacity,flow,water,blend,
+    grain,pigment,loading:clamp(70+a.coverageMean*25,50,100),oiliness:clamp(40+a.density*35,20,95),spacing};
+}
 async function importBrushPresetFromPng(file){
   try{
     const buf=await file.arrayBuffer();
@@ -1605,22 +1708,31 @@ async function importBrushPresetFromPng(file){
       b=await deserializeBrush(Object.assign({},meta,{shapeTexture:meta.shapeTexture||dataURL}));
       setStatus('Imported "'+b.name+'" from PNG brush file — original dynamics restored');
     } else {
-      // No metadata: treat the PNG itself as the brush's shape/coverage texture and build a
-      // full working preset around it for the active (or best-guess) paint tool, so fluidity,
-      // watercolor response, grain and pigment all work immediately, matching how that brush
-      // would actually paint inside Rebelle.
+      // No metadata: analyze the swatch's own pixels — shape, density, softness, roughness —
+      // and derive REAL, differing dynamics from that analysis (not a fixed 'round' default),
+      // so each imported brush actually paints differently, the way distinct Rebelle brushes do.
       const targetTool=(TOOLS_BY_ID[currentTool] && TOOLS_BY_ID[currentTool].kind==='paint') ? currentTool : 'watercolor';
+      const analysisCanvas=imageToCanvas(img,96);
+      const analysis=analyzeBrushPngShape(analysisCanvas.ctx,analysisCanvas.w,analysisCanvas.h);
+      const seed=hashCoverage(analysisCanvas.ctx,analysisCanvas.w,analysisCanvas.h);
+      const baseSizeByTool={oil:60,expressoil:60,watercolor:48,ink:36,pencil:16,pastel:44,marker:34,airbrush:66}[targetTool]||48;
+      const params=brushParamsFromPngAnalysis(analysis,seed,baseSizeByTool);
       const shapeTex=extractCoverageTexture(g,w,h,false);
       const niceName=file.name.replace(/\.[a-z0-9]+$/i,'').replace(/[_-]+/g,' ').trim()||'Imported Brush';
       const key='custom_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,7);
-      b=Object.assign(synthBrush(niceName,'round',48,targetTool,
-          {oil:'oil',expressoil:'expressoil',watercolor:'watercolor',ink:'ink',pencil:'dryMedia',pastel:'dryMedia',marker:'marker',airbrush:'airbrush'}[targetTool]||'watercolor',
-          'My Brushes'),
-        {name:niceName,key,maxSize:clamp(48*4,80,1500),shapeTex,shapeTexURL:dataURL,shapeInvert:false,
-         sizeBehavior:'pressure',opacityBehavior:'pressure-soft',tipTilt:0,brushForm:0,smudgeOnStroke:false,
-         jitter:{enabled:false,mode:'stamp',hue:0,sat:0,bright:0},imported:true,importedFromPng:true});
-      setStatus('Imported "'+b.name+'" from PNG — used as brush shape with full '+
-        (TOOLS_BY_ID[targetTool]?TOOLS_BY_ID[targetTool].name:targetTool)+' fluidity/watercolor dynamics');
+      const engineForTool={oil:'oil',expressoil:'expressoil',watercolor:'watercolor',ink:'ink',pencil:'dryMedia',pastel:'dryMedia',marker:'marker',airbrush:'airbrush'}[targetTool]||'watercolor';
+      b={name:niceName,group:'My Brushes',tool:targetTool,engine:engineForTool,
+        shape:params.shape,size:params.size,maxSize:params.maxSize,opacity:params.opacity,flow:params.flow,
+        water:params.water,blend:params.blend,grain:params.grain,pigment:params.pigment,
+        loading:params.loading,oiliness:params.oiliness,spacing:params.spacing,tolerance:20,
+        key,shapeTex,shapeTexURL:dataURL,shapeInvert:false,
+        sizeBehavior:'pressure',opacityBehavior:'pressure-soft',tipTilt:0,brushForm:0,smudgeOnStroke:false,
+        jitter:{enabled:false,mode:'stamp',hue:0,sat:0,bright:0},imported:true,importedFromPng:true,
+        pngAnalysis:{shape:analysis.shape,aspect:+analysis.aspect.toFixed(2),density:+analysis.density.toFixed(2),
+          fragments:analysis.fragments,roughness:+analysis.roughness.toFixed(2)}};
+      setStatus('Imported "'+b.name+'" from PNG — detected shape "'+analysis.shape+'" (aspect '+analysis.aspect.toFixed(1)+
+        ', density '+Math.round(analysis.density*100)+'%, '+analysis.fragments+' fragment'+(analysis.fragments>1?'s':'')+
+        ') → size '+params.size+'px, water '+params.water.toFixed(2)+', grain '+params.grain.toFixed(2));
     }
     finishBrushPresetImport([b],b.tool,true);
   }catch(e){
