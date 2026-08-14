@@ -1708,7 +1708,7 @@ function buildBrushesFromReconSpecs(specs,groupName,keyPrefix,defaultTool,defaul
       loading:spec.loading!=null?spec.loading:82, oiliness:spec.oiliness!=null?spec.oiliness:55,
       spacing:spec.spacing, tolerance:20,
       sizeBehavior:spec.sizeBehavior||'pressure', opacityBehavior:spec.opacityBehavior||'pressure-soft',
-      tipTilt:0, brushForm:0,
+      tipTilt:spec.tipTilt||0, brushForm:0,
       smudgeOnStroke:!!spec.smudgeOnStroke, smudgeDensity:spec.smudgeDensity!=null?spec.smudgeDensity:80,
       length:100, mixingMode:spec.mixingMode||'transparent', paintMode:spec.paintMode||'paintmix',
       jitter:spec.jitter?{...spec.jitter}:{enabled:false,mode:'stamp',hue:0,sat:0,bright:0},
@@ -1728,7 +1728,181 @@ function buildBrushesFromReconSpecs(specs,groupName,keyPrefix,defaultTool,defaul
 function buildReconstructedBrushLibrary(){
   buildBrushesFromReconSpecs(RECON_BRUSH_SPECS,'Reconstructed (from sample sheet)','recon',null,null);
   buildBrushesFromReconSpecs(WATERCOLOR_RECON_SPECS,'Reconstructed Watercolor (from library screenshot)','reconwc','watercolor','watercolor');
+  buildBrushesFromReconSpecs(INK_RECON_SPECS,'Reconstructed Ink (40-brush pack)','reconink','ink','ink');
 }
+/* =========================================================================
+   INK RECONSTRUCTION — 40 brushes, from the user's Rebelle Ink library
+   screenshot plus a detailed family-by-family Brush Creator reconstruction
+   (Wood/dry-grain, Fountain, Reed Pen, Bullet/heavy, Dry Ink/Scratch, Ink
+   Brush, Hatching, Grunge, Wash/Fluid, Calligraphic, Special-effects).
+   Same honest framing as the watercolor/graphite sets: these numbers are a
+   best-effort VISUAL reconstruction (confirmed explicitly by the source
+   analysis, which also cross-referenced Rebelle 7's own documented Water
+   ranges: 0-5 very dry/scratchy, 5-15 dry/textured, 15-30 normal,
+   30-50 fluid, 50+ very wet/spreading — used directly below).
+   Field mapping (documented once here, same conventions as the other two
+   reconstruction tables):
+     - Max Size/Size(%) -> maxSize/size(px), scaled 0.4x to this engine's
+       working range.
+     - Opacity/Water(%) -> opacity/water(0-1) directly — Water bands from
+       the Rebelle 7 doc above are preserved as relative ordering across
+       all 40 brushes (Wood/Reed dry family sits low, Wash/Fluid family
+       sits high).
+     - Grain Strength(%) -> grain(0-1) + matching real procedural preset:
+       Chisel Streaks for wood-grain/reed families, Scratches for
+       dry-ink/scratch, Spatter Dots for speckle/splatter, Craquelure+
+       Torn Splotch shape for the stamped/broken "Ink Stamp" brush,
+       Coarse/Fine Sponge for brush-ink and fountain-pen families,
+       Soft Noise for the wash/fluid family.
+     - Pressure->Size/Opacity(+N) -> sizeBehavior/opacityBehavior curve,
+       same >=40/15-39/<15 -> pressure/pressure-soft/constant convention.
+     - Spacing -> brush.spacing directly (literal 1:1, as before).
+     - Shape Angle (deg, hatching/calligraphy families) -> brush.tipTilt,
+       scaled so +-20deg maps to +-100 (this engine's tipTilt range).
+       IMPORTANT HONEST LIMIT: the source explicitly asks for "Rotation:
+       None" on the hatching family — a FIXED absolute angle regardless of
+       stroke direction. This engine's tipTilt is only an offset RELATIVE
+       to the stroke's own direction (see footprint()); there is no true
+       "ignore stroke direction entirely" mode here, so hatching brushes
+       will still rotate somewhat with the stroke instead of staying
+       locked at exactly -25deg/-30deg. Documented rather than faked.
+     - Hatching's "narrow rectangle" shape + Chisel Comb GENERATOR (a
+       comb-toothed pattern) is used as the shapeTex for a more literal
+       parallel-tooth texture instead of just a bare liner/flat footprint.
+     - Mixing Mode: 'opaque' for the Bullet family (explicitly described
+       as dense/compact/high-opacity ink, matching this engine's Opaque
+       mixing behavior), 'transparent' for everything else per the
+       source's Water-driven characterization of the rest of the set.
+   Not implemented (no equivalent in this engine, flagged rather than
+   faked): Angle Jitter, true Scatter (per-stamp position randomization),
+   Random Start/Stamp Offset, Grain Follow/Stretched/Tiled MODE switching
+   (grain here always tiles to world space), Grain Smoothing on/off. ========================================================================= */
+const INK_RECON_SPECS=[
+ {name:'Recon Wood',shape:'flat',sizePx:22,maxSizePx:72,opacity:1,water:0.1,grain:0.75,flow:1,spacing:25,
+  grainGen:['Chisel Streaks',{density:6,detail:7,contrast:7}],smudgeOnStroke:false,
+  sizeBehavior:'pressure-soft',opacityBehavior:'constant',mixingMode:'transparent'},
+ {name:'Recon Wood 2',shape:'flat',sizePx:23,maxSizePx:76,opacity:1,water:0.1,grain:0.82,flow:1,spacing:28,
+  grainGen:['Chisel Streaks',{density:7,detail:8,contrast:8}],smudgeOnStroke:false,
+  sizeBehavior:'pressure-soft',opacityBehavior:'constant',mixingMode:'transparent',
+  note:'Size/Opacity/Water (30/100/10) read directly off the screenshot\u2019s Properties panel'},
+ {name:'Recon Wood 3',shape:'flat',sizePx:19,maxSizePx:68,opacity:0.85,water:0.08,grain:0.68,flow:0.892,spacing:32,
+  grainGen:['Chisel Streaks',{density:5,detail:6,contrast:6}],smudgeOnStroke:false,
+  sizeBehavior:'pressure',opacityBehavior:'pressure-soft',mixingMode:'transparent'},
+ {name:'Recon Wood 4',shape:'flat',sizePx:27,maxSizePx:84,opacity:0.9,water:0.06,grain:0.9,flow:0.945,spacing:35,
+  grainGen:['Chisel Streaks',{density:8,detail:9,contrast:9}],smudgeOnStroke:false,
+  sizeBehavior:'pressure-soft',opacityBehavior:'constant',mixingMode:'transparent'},
+ {name:'Recon Wood 5',shape:'flat',sizePx:17,maxSizePx:48,opacity:0.75,water:0.07,grain:0.6,flow:0.788,spacing:18,
+  grainGen:['Chisel Streaks',{density:4,detail:5,contrast:5}],smudgeOnStroke:false,
+  sizeBehavior:'pressure-soft',opacityBehavior:'constant',mixingMode:'transparent'},
+ {name:'Recon Wood 6',shape:'flat',sizePx:17,maxSizePx:60,opacity:0.9,water:0.03,grain:0.95,flow:0.945,spacing:40,
+  grainGen:['Chisel Streaks',{density:9,detail:9,contrast:9}],smudgeOnStroke:false,
+  sizeBehavior:'pressure',opacityBehavior:'pressure-soft',mixingMode:'transparent'},
+ {name:'Recon Fountain',shape:'liner',sizePx:8,maxSizePx:26,opacity:1,water:0.12,grain:0.15,flow:1,spacing:8,
+  grainGen:['Fine Sponge',{density:2,detail:3,contrast:2}],smudgeOnStroke:false,
+  sizeBehavior:'pressure',opacityBehavior:'pressure-soft',mixingMode:'transparent'},
+ {name:'Recon Fountain Round',shape:'liner',sizePx:7,maxSizePx:22,opacity:1,water:0.15,grain:0.1,flow:1,spacing:7,
+  grainGen:['Fine Sponge',{density:1,detail:2,contrast:2}],smudgeOnStroke:false,
+  sizeBehavior:'pressure',opacityBehavior:'constant',mixingMode:'transparent'},
+ {name:'Recon Fountain Round 2',shape:'liner',sizePx:11,maxSizePx:32,opacity:1,water:0.12,grain:0.2,flow:1,spacing:9,
+  grainGen:['Fine Sponge',{density:2,detail:3,contrast:3}],smudgeOnStroke:false,
+  sizeBehavior:'pressure',opacityBehavior:'pressure-soft',mixingMode:'transparent'},
+ {name:'Recon Fountain Round 3',shape:'liner',sizePx:14,maxSizePx:40,opacity:0.95,water:0.25,grain:0.1,flow:0.997,spacing:8,
+  grainGen:['Fine Sponge',{density:1,detail:2,contrast:2}],smudgeOnStroke:true,smudgeDensity:60,
+  sizeBehavior:'pressure',opacityBehavior:'pressure-soft',mixingMode:'transparent'},
+ {name:'Recon Fountain Square',shape:'flat',sizePx:10,maxSizePx:32,opacity:1,water:0.1,grain:0.15,flow:1,spacing:7,
+  grainGen:['Fine Sponge',{density:2,detail:3,contrast:2}],smudgeOnStroke:false,
+  sizeBehavior:'pressure',opacityBehavior:'constant',mixingMode:'transparent'},
+ {name:'Recon Fountain Square 2',shape:'flat',sizePx:14,maxSizePx:44,opacity:1,water:0.15,grain:0.2,flow:1,spacing:8,
+  grainGen:['Fine Sponge',{density:2,detail:4,contrast:3}],smudgeOnStroke:false,tipTilt:75,
+  sizeBehavior:'pressure',opacityBehavior:'constant',mixingMode:'transparent'},
+ {name:'Recon Reed Pen',shape:'liner',sizePx:11,maxSizePx:36,opacity:1,water:0.08,grain:0.45,flow:1,spacing:15,
+  grainGen:['Chisel Streaks',{density:4,detail:5,contrast:5}],smudgeOnStroke:false,
+  sizeBehavior:'pressure',opacityBehavior:'pressure-soft',mixingMode:'transparent'},
+ {name:'Recon Reed Pen 2',shape:'liner',sizePx:13,maxSizePx:40,opacity:0.9,water:0.04,grain:0.65,flow:0.945,spacing:22,
+  grainGen:['Chisel Streaks',{density:6,detail:7,contrast:6}],smudgeOnStroke:false,
+  sizeBehavior:'pressure',opacityBehavior:'constant',mixingMode:'transparent'},
+ {name:'Recon Reed Pen 3',shape:'liner',sizePx:14,maxSizePx:48,opacity:0.85,water:0.06,grain:0.8,flow:0.892,spacing:30,
+  grainGen:['Chisel Streaks',{density:7,detail:8,contrast:8}],smudgeOnStroke:false,
+  sizeBehavior:'pressure',opacityBehavior:'constant',mixingMode:'transparent'},
+ {name:'Recon Bullet',shape:'round',sizePx:14,maxSizePx:40,opacity:1,water:0.08,grain:0.05,flow:1,spacing:5,
+  grainGen:['Fine Sponge',{density:1,detail:2,contrast:1}],smudgeOnStroke:false,
+  sizeBehavior:'pressure-soft',opacityBehavior:'constant',mixingMode:'opaque'},
+ {name:'Recon Bullet 2',shape:'round',sizePx:24,maxSizePx:60,opacity:1,water:0.1,grain:0.2,flow:1,spacing:7,
+  grainGen:['Fine Sponge',{density:3,detail:4,contrast:3}],smudgeOnStroke:false,
+  sizeBehavior:'pressure',opacityBehavior:'constant',mixingMode:'opaque'},
+ {name:'Recon Bullet Dry',shape:'grunge',sizePx:18,maxSizePx:52,opacity:1,water:0.03,grain:0.55,flow:1,spacing:15,
+  grainGen:['Coarse Sponge',{density:6,detail:6,contrast:6}],smudgeOnStroke:false,
+  sizeBehavior:'pressure',opacityBehavior:'constant',mixingMode:'opaque'},
+ {name:'Recon Dry Ink',shape:'liner',sizePx:18,maxSizePx:60,opacity:0.8,water:0.02,grain:0.8,flow:0.84,spacing:35,
+  grainGen:['Scratches',{density:6,detail:7,contrast:7}],smudgeOnStroke:false,
+  sizeBehavior:'pressure',opacityBehavior:'pressure-soft',mixingMode:'transparent'},
+ {name:'Recon Dry Ink Fine',shape:'liner',sizePx:8,maxSizePx:32,opacity:0.7,water:0.01,grain:0.75,flow:0.735,spacing:28,
+  grainGen:['Scratches',{density:5,detail:8,contrast:6}],smudgeOnStroke:false,
+  sizeBehavior:'pressure',opacityBehavior:'constant',mixingMode:'transparent'},
+ {name:'Recon Scratch',shape:'liner',sizePx:10,maxSizePx:40,opacity:0.6,water:0,grain:0.9,flow:0.63,spacing:40,
+  grainGen:['Scratches',{density:7,detail:9,contrast:8}],smudgeOnStroke:false,
+  sizeBehavior:'pressure',opacityBehavior:'constant',mixingMode:'transparent',
+  note:'Deliberately closer to a pencil-like ink scratch per the source guidance'},
+ {name:'Recon Ink Brush',shape:'round',sizePx:31,maxSizePx:88,opacity:0.85,water:0.08,grain:0.55,flow:0.892,spacing:22,
+  grainGen:['Chisel Streaks',{density:5,detail:6,contrast:6}],smudgeOnStroke:true,smudgeDensity:75,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',mixingMode:'transparent'},
+ {name:'Recon Ink Brush Heavy',shape:'round',sizePx:40,maxSizePx:100,opacity:1,water:0.12,grain:0.35,flow:1,spacing:12,
+  grainGen:['Coarse Sponge',{density:4,detail:5,contrast:4}],smudgeOnStroke:true,smudgeDensity:80,
+  sizeBehavior:'pressure-soft',opacityBehavior:'constant',mixingMode:'transparent'},
+ {name:'Recon Ink Brush Dry',shape:'round',sizePx:32,maxSizePx:92,opacity:0.9,water:0.04,grain:0.75,flow:0.945,spacing:30,
+  grainGen:['Coarse Sponge',{density:7,detail:7,contrast:7}],smudgeOnStroke:false,
+  sizeBehavior:'pressure-soft',opacityBehavior:'constant',mixingMode:'transparent'},
+ {name:'Recon Hatch',shape:'round',sizePx:10,maxSizePx:32,opacity:0.85,water:0.06,grain:0.1,flow:0.892,spacing:45,
+  shapeGen:['Chisel Comb',{density:2,detail:6,contrast:3}],grainGen:['Fine Sponge',{density:1,detail:2,contrast:1}],
+  smudgeOnStroke:false,tipTilt:-100,sizeBehavior:'pressure-soft',opacityBehavior:'constant',mixingMode:'transparent',
+  note:'Rotation:None requested \u2014 this engine can only offset relative to stroke direction (tipTilt), not lock an absolute angle; see comment above'},
+ {name:'Recon Hatch Heavy',shape:'round',sizePx:14,maxSizePx:40,opacity:1,water:0.05,grain:0.2,flow:1,spacing:30,
+  shapeGen:['Chisel Comb',{density:3,detail:7,contrast:4}],grainGen:['Fine Sponge',{density:2,detail:3,contrast:2}],
+  smudgeOnStroke:false,tipTilt:-100,sizeBehavior:'constant',opacityBehavior:'constant',mixingMode:'transparent'},
+ {name:'Recon Hatch Dry',shape:'round',sizePx:12,maxSizePx:40,opacity:0.75,water:0.02,grain:0.65,flow:0.788,spacing:40,
+  shapeGen:['Chisel Comb',{density:5,detail:5,contrast:5}],grainGen:['Coarse Sponge',{density:5,detail:6,contrast:5}],
+  smudgeOnStroke:false,tipTilt:-100,sizeBehavior:'constant',opacityBehavior:'constant',mixingMode:'transparent'},
+ {name:'Recon Loose Hatch',shape:'round',sizePx:7,maxSizePx:28,opacity:0.65,water:0.05,grain:0.3,flow:0.683,spacing:55,
+  shapeGen:['Chisel Comb',{density:2,detail:4,contrast:2}],grainGen:['Fine Sponge',{density:3,detail:4,contrast:3}],
+  smudgeOnStroke:false,tipTilt:-100,sizeBehavior:'constant',opacityBehavior:'constant',mixingMode:'transparent'},
+ {name:'Recon Grunge Ink',shape:'grunge',sizePx:31,maxSizePx:88,opacity:0.8,water:0.05,grain:0.85,flow:0.84,spacing:28,
+  grainGen:['Coarse Sponge',{density:8,detail:8,contrast:8}],smudgeOnStroke:false,
+  sizeBehavior:'pressure-soft',opacityBehavior:'constant',mixingMode:'transparent'},
+ {name:'Recon Grunge Heavy',shape:'grunge',sizePx:40,maxSizePx:100,opacity:1,water:0.08,grain:0.7,flow:1,spacing:15,
+  grainGen:['Coarse Sponge',{density:7,detail:7,contrast:7}],smudgeOnStroke:true,smudgeDensity:70,
+  sizeBehavior:'pressure-soft',opacityBehavior:'constant',mixingMode:'transparent'},
+ {name:'Recon Fluid Ink',shape:'wash',sizePx:45,maxSizePx:100,opacity:0.7,water:0.3,grain:0.2,flow:0.735,spacing:10,
+  grainGen:['Soft Noise',{density:2,detail:2,contrast:2}],smudgeOnStroke:true,smudgeDensity:85,
+  sizeBehavior:'pressure-soft',opacityBehavior:'constant',mixingMode:'transparent'},
+ {name:'Recon Wet Ink',shape:'wash',sizePx:60,maxSizePx:120,opacity:0.6,water:0.45,grain:0.1,flow:0.63,spacing:8,
+  grainGen:['Soft Noise',{density:1,detail:2,contrast:1}],smudgeOnStroke:true,smudgeDensity:90,
+  sizeBehavior:'constant',opacityBehavior:'constant',mixingMode:'transparent'},
+ {name:'Recon Ink Wash',shape:'wash',sizePx:96,maxSizePx:160,opacity:0.35,water:0.6,grain:0.05,flow:0.367,spacing:6,
+  grainGen:['Soft Noise',{density:1,detail:1,contrast:1}],smudgeOnStroke:true,smudgeDensity:95,
+  sizeBehavior:'constant',opacityBehavior:'constant',mixingMode:'transparent'},
+ {name:'Recon Calligraphy',shape:'flat',sizePx:14,maxSizePx:48,opacity:1,water:0.1,grain:0.1,flow:1,spacing:7,
+  grainGen:['Fine Sponge',{density:1,detail:2,contrast:1}],smudgeOnStroke:false,tipTilt:100,
+  sizeBehavior:'pressure',opacityBehavior:'constant',mixingMode:'transparent'},
+ {name:'Recon Calligraphy Dry',shape:'flat',sizePx:16,maxSizePx:52,opacity:0.95,water:0.04,grain:0.45,flow:0.997,spacing:12,
+  grainGen:['Chisel Streaks',{density:4,detail:5,contrast:4}],smudgeOnStroke:false,
+  sizeBehavior:'pressure',opacityBehavior:'constant',mixingMode:'transparent'},
+ {name:'Recon Calligraphy Rough',shape:'flat',sizePx:19,maxSizePx:60,opacity:0.9,water:0.06,grain:0.6,flow:0.945,spacing:15,
+  grainGen:['Chisel Streaks',{density:6,detail:6,contrast:5}],smudgeOnStroke:false,
+  sizeBehavior:'pressure',opacityBehavior:'constant',mixingMode:'transparent'},
+ {name:'Recon Speckle Ink',shape:'splat',sizePx:25,maxSizePx:72,opacity:0.7,water:0.05,grain:0.8,flow:0.735,spacing:35,
+  grainGen:['Spatter Dots',{density:6,detail:7,contrast:6}],smudgeOnStroke:false,
+  sizeBehavior:'constant',opacityBehavior:'constant',mixingMode:'transparent'},
+ {name:'Recon Splatter Ink',shape:'splat',sizePx:40,maxSizePx:100,opacity:0.75,water:0.15,grain:0.7,flow:0.788,spacing:30,
+  grainGen:['Spatter Dots',{density:8,detail:8,contrast:7}],smudgeOnStroke:false,
+  sizeBehavior:'constant',opacityBehavior:'constant',mixingMode:'transparent'},
+ {name:'Recon Ink Stamp',shape:'round',sizePx:40,maxSizePx:100,opacity:0.9,water:0.05,grain:0.85,flow:0.945,spacing:60,
+  shapeGen:['Torn Splotch',{density:5,detail:7,contrast:5,seed:3}],grainGen:['Craquelure',{density:6,detail:7,contrast:6}],
+  smudgeOnStroke:false,sizeBehavior:'constant',opacityBehavior:'constant',mixingMode:'transparent'},
+ {name:'Recon Charcoal Ink',shape:'grunge',sizePx:40,maxSizePx:100,opacity:0.8,water:0.03,grain:0.9,flow:0.84,spacing:30,
+  grainGen:['Coarse Sponge',{density:8,detail:8,contrast:8}],smudgeOnStroke:false,
+  sizeBehavior:'pressure',opacityBehavior:'constant',mixingMode:'transparent',
+  note:'Deliberately hybrid dry-charcoal/ink brush per the source guidance'},
+];
 
 /* ---- Brush Preset (JSON) export / import — our own open, documented format ---- */
 function serializeBrush(b){
