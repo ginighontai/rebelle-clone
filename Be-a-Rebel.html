@@ -1615,6 +1615,33 @@ function findEmbeddedBrushJSON(chunks){
    unrecognized name falls back to a neutral round brush — and tell the user
    plainly that fine-tuning in Brush Creator is expected, instead of
    pretending pixel-guessing produced Rebelle-accurate values. */
+// Real substring-based shape detection from a brush's file/display name — unlike
+// SHAPE_OVERRIDE (which only exact-matches a few literal built-in names like 'Liner' and
+// silently falls through to the caller's default for anything else, e.g. 'Liner narrow'),
+// this checks whether any of these words appear ANYWHERE in the name, case-insensitively,
+// so real-world file names ('YT brush B1', 'Lines A02', 'Fine liner v2') still get mapped to
+// a genuinely different footprint instead of always defaulting to round.
+function shapeFromFileName(name){
+  const n=name.toLowerCase();
+  if(/liner|rigger|nib|line|fine|thin|hair/.test(n)) return 'liner';
+  if(/flat|bright|chisel|comb/.test(n)) return 'flat';
+  if(/filbert|blunt/.test(n)) return 'filbert';
+  if(/fan/.test(n)) return 'fan';
+  if(/mop|wash|cloud|glaze|bg|background/.test(n)) return 'mop';
+  if(/knife|palette/.test(n)) return 'knife';
+  if(/splat|spatter|spray|drip|drop/.test(n)) return 'splat';
+  if(/grunge|shred|rough|texture|grain|rock|stone/.test(n)) return 'grunge';
+  return 'round';
+}
+// Deterministic 0..1 hash of a string (same input always produces the same output) — used to
+// nudge numeric brush parameters within a real range so two files sharing a shape category
+// (or matching zero keywords at all) still come out numerically distinct, without relying on
+// Math.random() (which would make re-importing the same file produce a different brush).
+function hashString(str){
+  let h=2166136261;
+  for(let i=0;i<str.length;i++){ h=(h^str.charCodeAt(i))>>>0; h=Math.imul(h,16777619)>>>0; }
+  return (h>>>0)/4294967295;
+}
 async function importBrushPresetFromPng(file){
   try{
     const buf=await file.arrayBuffer();
@@ -1631,18 +1658,31 @@ async function importBrushPresetFromPng(file){
       b=await deserializeBrush(Object.assign({},meta,{shapeTexture:meta.shapeTexture||dataURL}));
       setStatus('Imported "'+b.name+'" from PNG brush file — original dynamics restored');
     } else {
-      // No embedded metadata (the normal case — see comment above): use the SAME
-      // filename-keyword logic as the built-in brush library, so the name you gave the
-      // file/brush actually drives real, differing dynamics instead of every unlabeled
-      // swatch collapsing onto the same guessed shape.
+      // No embedded metadata (the normal case — see comment above): infer a real footprint
+      // SHAPE from the filename via substring matching (shapeFromFileName — NOT the old
+      // SHAPE_OVERRIDE table, which only exact-matches a handful of literal built-in brush
+      // names like 'Liner' and silently ignored anything like 'Liner narrow'), then run the
+      // same keyword-driven dynamics synthBrush() uses for the built-in library, seeded with
+      // that real shape instead of a hardcoded 'round'. A deterministic hash of the filename
+      // also nudges size/water/grain within a real range so two files that match NO keywords
+      // (e.g. 'Round', 'Lines A02') still end up numerically distinct rather than bit-identical.
       const targetTool=(TOOLS_BY_ID[currentTool] && TOOLS_BY_ID[currentTool].kind==='paint') ? currentTool : 'watercolor';
       const engineForTool={oil:'oil',expressoil:'expressoil',watercolor:'watercolor',ink:'ink',pencil:'dryMedia',pastel:'dryMedia',marker:'marker',airbrush:'airbrush'}[targetTool]||'watercolor';
       const baseSizeByTool={oil:60,expressoil:60,watercolor:48,ink:36,pencil:16,pastel:44,marker:34,airbrush:66}[targetTool]||48;
       const niceName=file.name.replace(/\.[a-z0-9]+$/i,'').replace(/[_-]+/g,' ').trim()||'Imported Brush';
-      // synthBrush() infers shape from a defaultShape hint + name keywords; we don't know
-      // the real tip shape, so start from 'round' (Rebelle's most common base tip) and let
-      // keyword matches (liner, mop, splat, grunge, thick, soft, hard, etc.) do the real work.
-      const params=synthBrush(niceName,'round',baseSizeByTool,targetTool,engineForTool,'My Brushes');
+      const detectedShape=shapeFromFileName(niceName);
+      const params=synthBrush(niceName,detectedShape,baseSizeByTool,targetTool,engineForTool,'My Brushes');
+      params.shape=detectedShape; // synthBrush() only honors SHAPE_OVERRIDE for exact literal
+                                   // matches, so force the real detected shape through directly.
+      // Deterministic per-filename variation (not Math.random — same file always imports the
+      // same way) so brushes with no keyword hits at all still differ numerically instead of
+      // collapsing onto identical default numbers.
+      const seed=hashString(niceName);
+      const jitter=(lo,hi)=>lo+(hi-lo)*seed;
+      params.size=Math.round(clamp(params.size*jitter(0.75,1.35),8,240));
+      params.water=clamp(params.water*jitter(0.8,1.25),0.03,0.98);
+      params.grain=clamp(params.grain*jitter(0.7,1.4),0.02,0.98);
+      params.opacity=clamp(params.opacity*jitter(0.85,1.15),0.08,0.95);
       const shapeTex=extractCoverageTexture(g,w,h,false);
       const key='custom_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,7);
       b=Object.assign(params,{key,maxSize:clamp(params.size*5,90,1500),
@@ -1650,9 +1690,10 @@ async function importBrushPresetFromPng(file){
         sizeBehavior:'pressure',opacityBehavior:'pressure-soft',tipTilt:0,brushForm:0,smudgeOnStroke:false,
         jitter:{enabled:false,mode:'stamp',hue:0,sat:0,bright:0},imported:true,importedFromPng:true,
         needsShapeReview:true});
-      setStatus('Imported "'+b.name+'" — Rebelle .png brushes store their real shape data in an '+
-        'undocumented format we cannot read, so dynamics were guessed from the file name ("'+niceName+
-        '"). Open Brush Creator → Shape & Grain to fine-tune it to match the original.');
+      setStatus('Imported "'+b.name+'" as a '+detectedShape+' brush (size '+params.size+'px, water '+
+        params.water.toFixed(2)+', grain '+params.grain.toFixed(2)+') — Rebelle .png files store real '+
+        'shape data in an undocumented format we cannot read, so this was inferred from the file name. '+
+        'Open Brush Creator → Shape & Grain to fine-tune it to match the original.');
     }
     finishBrushPresetImport([b],b.tool,true);
   }catch(e){
