@@ -2815,6 +2815,17 @@ function depositWet(L,x,y,pressure,angle,speed,b,bias){
     // means the texture pattern survives indefinitely, however long the stroke/however many
     // times it's re-stroked, instead of washing out to solid coverage.
     const grainCeilingMul = grainAmt>0.02 ? lerp(1-grainAmt*0.55, 1, tooth) : 1;
+    // BUG FIX (found via actual browser testing, not just code review): a brush's own
+    // opacity setting only scaled amountBase (the per-dab speed), not the pigmentApproach
+    // plateau itself — so a deliberately light/low-opacity wash brush (e.g. opacity 0.3)
+    // still had pd climb toward the SAME ~1.5 ceiling as a full-opacity brush once a stroke
+    // contained enough overlapping dabs, then got re-multiplied by opacity at render time
+    // (pd*opacity), landing well above the intended visual lightness — confirmed directly:
+    // a brush with opacity=0.3 measured pd=1.32 after one normal-length stroke, rendering
+    // at alpha~0.39 instead of staying near the intended ~0.3 range. Scaling the ceiling by
+    // opacity (in addition to grain) means a light wash brush's pixels approach a genuinely
+    // low plateau and stay light no matter how long the stroke or how many dabs overlap it.
+    const opacityCeilingMul = clamp(0.35+b.opacity*0.9,0.35,1.25);
     const preWet=L.wet[i]; // wetness already on the paper BEFORE this stamp — drives instant bloom below
     // Pixels with ~zero prior coverage have no meaningful stored color (buffers default to
     // black). Treat such pixels as if their "old color" were the new paint color itself,
@@ -2824,17 +2835,17 @@ function depositWet(L,x,y,pressure,angle,speed,b,bias){
     if(mode==='paint' && bias.subtractive){
       const a=clamp(amount*1.8,0,1);
       L.pr[i]=lerp(oR,col.r,a); L.pg[i]=lerp(oG,col.g,a); L.pb[i]=lerp(oB,col.b,a);
-      L.pd[i]=clamp(old+pigmentApproachIncrement(old,amount,1.5*grainCeilingMul),0,2.4);
+      L.pd[i]=clamp(old+pigmentApproachIncrement(old,amount,1.5*grainCeilingMul*opacityCeilingMul),0,2.4);
     } else if(bias.flatCap){
-      if(amount>old*0.4){ L.pr[i]=col.r; L.pg[i]=col.g; L.pb[i]=col.b; L.pd[i]=clamp(old+pigmentApproachIncrement(old,amount,2.2*grainCeilingMul),0,2.2); }
+      if(amount>old*0.4){ L.pr[i]=col.r; L.pg[i]=col.g; L.pb[i]=col.b; L.pd[i]=clamp(old+pigmentApproachIncrement(old,amount,2.2*grainCeilingMul*opacityCeilingMul),0,2.2); }
     } else if(bias.subtractive && b.mixingMode==='opaque'){
       // Opaque (gouache-like): dense, flat color coverage rather than glazing through.
       const a=clamp(amount*2.2,0,1);
       L.pr[i]=lerp(oR,col.r,a); L.pg[i]=lerp(oG,col.g,a); L.pb[i]=lerp(oB,col.b,a);
-      L.pd[i]=clamp(old+pigmentApproachIncrement(old,amount,2.4*grainCeilingMul),0,2.4);
+      L.pd[i]=clamp(old+pigmentApproachIncrement(old,amount,2.4*grainCeilingMul*opacityCeilingMul),0,2.4);
     } else if(bias.subtractive && b.mixingMode==='semitransparent'){
       // Midpoint: subtractive glazing blended with a direct opacity-driven mix.
-      const total=old+pigmentApproachIncrement(old,amount,1.8*grainCeilingMul)+1e-6;
+      const total=old+pigmentApproachIncrement(old,amount,1.8*grainCeilingMul*opacityCeilingMul)+1e-6;
       const subR=255-((255-oR)*old+(255-col.r)*amount)/total, subG=255-((255-oG)*old+(255-col.g)*amount)/total, subB=255-((255-oB)*old+(255-col.b)*amount)/total;
       const a=clamp(amount*1.5,0,1);
       const opR=lerp(oR,col.r,a), opG=lerp(oG,col.g,a), opB=lerp(oB,col.b,a);
@@ -2844,12 +2855,12 @@ function depositWet(L,x,y,pressure,angle,speed,b,bias){
     } else if(bias.subtractive && pigmentMixing){
       // Real Pigment Color Mixing: mix in approximate RYB pigment space instead of the RGB
       // complement, so e.g. yellow+blue trends toward green like actual paint, not gray-brown.
-      const total=old+pigmentApproachIncrement(old,amount,1.5*grainCeilingMul)+1e-6, t=clamp((total-old)/total,0,1);
+      const total=old+pigmentApproachIncrement(old,amount,1.5*grainCeilingMul*opacityCeilingMul)+1e-6, t=clamp((total-old)/total,0,1);
       const mixed=mixNaturalRGB(oR,oG,oB,colRyb,t);
       L.pr[i]=mixed.r; L.pg[i]=mixed.g; L.pb[i]=mixed.b;
       L.pd[i]=clamp(total,0,2.4);
     } else if(bias.subtractive){
-      const total=old+pigmentApproachIncrement(old,amount,1.5*grainCeilingMul)+1e-6;
+      const total=old+pigmentApproachIncrement(old,amount,1.5*grainCeilingMul*opacityCeilingMul)+1e-6;
       const t=(total-old)/total;
       L.pr[i]=255-((255-oR)*(1-t)+(255-col.r)*t);
       L.pg[i]=255-((255-oG)*(1-t)+(255-col.g)*t);
@@ -2858,7 +2869,7 @@ function depositWet(L,x,y,pressure,angle,speed,b,bias){
     } else {
       const a=clamp(amount,0,1);
       L.pr[i]=oR*(1-a)+col.r*a; L.pg[i]=oG*(1-a)+col.g*a; L.pb[i]=oB*(1-a)+col.b*a;
-      L.pd[i]=clamp(old+pigmentApproachIncrement(old,amount,1.5*grainCeilingMul),0,2.4);
+      L.pd[i]=clamp(old+pigmentApproachIncrement(old,amount,1.5*grainCeilingMul*opacityCeilingMul),0,2.4);
     }
     if(bias.waterMul>0){
       const addW=b.water*bias.waterMul*fall*(1-absorbMap[i]*(V.absorbency/10)*0.5);
@@ -3840,7 +3851,19 @@ canvas.addEventListener('pointermove',e=>{
   if(!pointerDown) return;
   const useLineAssist=(straightLineAssist||e.shiftKey) && straightLineAnchor && (kind==='paint'||kind==='eraser'||kind==='water'||kind==='dry');
   const usePerspective=perspectiveRuler.enabled && straightLineAnchor && (kind==='paint'||kind==='eraser'||kind==='water'||kind==='dry');
-  const evs=e.getCoalescedEvents?e.getCoalescedEvents():[e];
+  // getCoalescedEvents() exists on the PointerEvent prototype in Chromium-based browsers
+  // even for events that were never dispatched through a real OS input pipeline (e.g.
+  // synthetically constructed PointerEvents used for testing, or certain virtual/injected
+  // input paths) — but in that case it returns an EMPTY array rather than throwing or being
+  // undefined. The previous code only guarded against the method not existing at all
+  // (e.getCoalescedEvents ? ... : [e]), so whenever the method exists but legitimately
+  // returns [], the forEach below silently ran zero times: lastPoint never advanced and
+  // paint() never got called for that move, even though the event fired with no error —
+  // indistinguishable from a fully unresponsive drag until traced with real pointer state.
+  // Falling back to [e] whenever the coalesced list is empty fixes this while still using
+  // real coalesced sub-events (higher precision) whenever the browser actually provides them.
+  const coalesced=e.getCoalescedEvents?e.getCoalescedEvents():null;
+  const evs=(coalesced && coalesced.length)?coalesced:[e];
   evs.forEach(ev=>{
     let raw=pointFromEvent(ev);
     updatePressureReadout(raw);
