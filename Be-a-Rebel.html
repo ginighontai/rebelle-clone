@@ -385,7 +385,7 @@ select{background:var(--input-bg);border:1px solid var(--line);color:var(--text)
             <div class="panelHead"><span class="dash" data-collapse></span><span class="ttl">Tilt</span><button class="hbtn" data-menubtn="Tilt">≡</button></div>
             <div class="panelBody" id="tiltBody"></div>
           </div>
-          <div class="panel collapsed" id="panelRulers">
+          <div class="panel" id="panelRulers">
             <div class="panelHead"><span class="dash" data-collapse></span><span class="ttl">Rulers</span><button class="hbtn" data-menubtn="Rulers">≡</button></div>
             <div class="panelBody" id="rulersBody"></div>
           </div>
@@ -398,7 +398,7 @@ select{background:var(--input-bg);border:1px solid var(--line);color:var(--text)
           <div class="panelHead"><span class="dash" data-collapse></span><span class="ttl">Visual Settings</span><button class="hbtn" data-menubtn="Visual">≡</button></div>
           <div class="panelBody" id="visualBody"></div>
         </div>
-        <div class="panel collapsed" id="panelLayerSettings">
+        <div class="panel" id="panelLayerSettings">
           <div class="panelHead"><span class="dash" data-collapse></span><span class="ttl">Layer Settings</span><button class="hbtn" data-menubtn="LayerSettings">≡</button></div>
           <div class="panelBody" id="layerSettingsBody"></div>
         </div>
@@ -1154,6 +1154,10 @@ function applyDeckledEdges(){
   }
 }
 function setPaper(key){
+  // Guard against an unknown key: this used to assign paper=undefined and then throw inside
+  // buildPaper() on paper.tint, which leaves the whole paper/tooth/absorbency state broken and
+  // the canvas unpaintable. Now an unrecognised key is simply ignored.
+  if(!PAPERS[key]){ setStatus('Unknown paper "'+key+'" — keeping '+(paper?paper.name:'current surface')); return; }
   paperKey=key; paper=PAPERS[key]; buildPaper();
   refreshBindings('layer');
   setStatus('Paper: '+paper.name);
@@ -4449,8 +4453,18 @@ function diffuseWetBands(L,diffF,edgeF,tiltOn,gDirX,gDirY,gStrength,granStr){
         }
         const j=ny*W+nx;
         // Gravity bias (Canvas Tilt): downhill neighbours receive proportionally more.
+        // PIGMENT RUNOFF AND SEPARATION: how fast a fluid runs depends on how DILUTE it is.
+        // A heavily watered, thin mix streaks away quickly; a thick, saturated pool of pigment
+        // is viscous and creeps. Previously gravity applied one uniform pull regardless of what
+        // was in the water, so everything ran at the same rate and no separation could occur —
+        // this is what produces the characteristic effect of a wash separating as it runs, with
+        // the watery fraction racing ahead and leaving the dense pigment behind.
         let gw=1;
-        if(tiltOn){ const align=DX[k]*gDirX+DY[k]*gDirY; gw=1+Math.max(0,align)*gStrength*2.6; }
+        if(tiltOn){
+          const align=DX[k]*gDirX+DY[k]*gDirY;
+          const dilution=w/(w+d*0.8+0.001); // ~1 = nearly pure water, ->0 = thick pigment paste
+          gw=1+Math.max(0,align)*gStrength*2.6*(0.45+dilution*1.1);
+        }
         // Paper heightmap bias: the brush engine reads the paper's tooth, and water/pigment run
         // OFF the raised peaks and POOL in the valleys. That is the physical origin of
         // granulation during a wet blend, and it was entirely absent from transport before —
@@ -4573,14 +4587,27 @@ function simulateLayer(L){
    drips, not a burst of noise. */
 function updateRivulets(L,tiltOn,gDirX,gDirY,gStrength){
   if(!L.rivulets) L.rivulets=[];
-  const maxActive=6;
+  // A steeply tilted canvas should shed MANY runs at once, not the same handful it sheds when
+  // flat. Instrumentation showed only 7 rivulets over 400 frames at full tilt, which is far too
+  // few to read as "gravity pulling the wash downward" — the cap, not the physics, was the limit.
+  const maxActive=tiltOn?(6+Math.round(gStrength*18)):6;
   const hadRivuletsBefore=L.rivulets.length>0;
   // Advance existing rivulets.
   for(let ri=L.rivulets.length-1; ri>=0; ri--){
     const r=L.rivulets[ri];
     const i=Math.round(r.y)*W+Math.round(r.x);
     const feed = (i>=0&&i<N) ? L.wet[i] : 0;
-    if(feed<0.25 || r.life<=0){ L.rivulets.splice(ri,1); continue; }
+    /* BUG: this used to terminate the rivulet whenever the pixel it currently sits on was drier
+       than 0.25 — i.e. the instant it left the puddle and reached dry paper, which is on its very
+       first step downhill. So a drip could never actually travel anywhere: it was destroyed
+       exactly when it started to become a drip. That is why tilting the canvas produced no
+       visible runs even with gravity working correctly underneath.
+       A real drip carries its own bead of liquid down dry paper and dies when that bead is spent.
+       So the carried volume (r.wet) is now what sustains it, and the surface it crosses only
+       REPLENISHES it when that surface happens to be wet (running back through a puddle tops the
+       drip up and lets it continue further, which is also what real runs do). */
+    if(r.wet<0.10 || r.life<=0){ L.rivulets.splice(ri,1); continue; }
+    if(feed>0.3) r.wet=Math.min(1.6,r.wet+feed*0.05); // crossing wet ground feeds the run
     r.life-=1;
     // Slight organic wobble so the stream isn't a perfectly straight line.
     const wob=(noise(r.x*0.15,r.seed+r.steps*0.08)-0.5)*0.6;
@@ -4597,36 +4624,81 @@ function updateRivulets(L,tiltOn,gDirX,gDirY,gStrength){
         if(!diffusionAllowed(L,xx,yy)) continue;
         const fall=1-dist/(rad+0.001);
         const jj=yy*W+xx;
-        L.wet[jj]=clamp(Math.max(L.wet[jj],r.wet*fall),0,1.6);
-        const dep=r.pigment*fall*0.35;
+        // Wet the trail, but less than the bead itself carries: at full strength the trail was
+        // wet enough that its own pigment immediately diffused away again, so runs measured the
+        // right LENGTH while being almost invisible.
+        L.wet[jj]=clamp(Math.max(L.wet[jj],r.wet*fall*0.7),0,1.6);
+        // Raised from 0.35: measured trails were laying down only ~0.13 density, which the
+        // surrounding wet diffusion then spread below the visibility threshold within a second,
+        // so the runs travelled their full length but left almost nothing behind to see.
+        const dep=r.pigment*fall*0.95;
         if(dep>0.0005){
           const od=L.pd[jj], tot=od+dep+1e-6;
-          L.pr[jj]=(L.pr[jj]*od+r.pr*dep)/tot; L.pg[jj]=(L.pg[jj]*od+r.pg*dep)/tot; L.pb[jj]=(L.pb[jj]*od+r.pb*dep)/tot;
+          // WET BLENDING IN MOTION: a running drip crossing another colour's stream mixes with
+          // it mid-flow. With Pigments on that secondary mixture is computed subtractively, so
+          // two streams crossing produce a real pigment mix rather than an RGB average that
+          // greys out — this path was a plain weighted average regardless of mixing mode.
+          if((naturalColors||L.useColorPigments) && od>0.01){
+            const t=clamp(dep/tot,0,1);
+            const mx=mixKM(L.pr[jj],L.pg[jj],L.pb[jj],r.pr,r.pg,r.pb,t);
+            L.pr[jj]=mx.r; L.pg[jj]=mx.g; L.pb[jj]=mx.b;
+          } else {
+            L.pr[jj]=(L.pr[jj]*od+r.pr*dep)/tot; L.pg[jj]=(L.pg[jj]*od+r.pg*dep)/tot; L.pb[jj]=(L.pb[jj]*od+r.pb*dep)/tot;
+          }
           L.pd[jj]=clamp(tot,0,2.4);
         }
         growBounds(L,xx,yy);
       }
     }
-    // Taper: the rivulet slowly consumes the puddle wetness feeding it and thins as it runs.
+    // Taper: the run consumes the puddle it passes over and steadily spends its own bead, so it
+    // thins and fades out rather than travelling forever. Spend rate scales inversely with tilt
+    // force — a steep canvas drives a drip further before it exhausts itself.
     L.wet[i]=Math.max(0,feed-0.02);
-    r.wet*=0.985; r.pigment*=0.99; r.width=Math.max(0.6,r.width*0.996);
+    const spend=lerp(0.994,0.9975,clamp(gStrength,0,1));
+    r.wet*=spend; r.pigment*=0.998; r.width=Math.max(0.6,r.width*0.997);
   }
   // Spawn new rivulets from overloaded puddle pixels (only when tilt/drip conditions call
   // for it), capped so at most a few run at once.
   if(L.rivulets.length>=maxActive || !L.wetBounds) return hadRivuletsBefore||L.rivulets.length>0;
   const b=L.wetBounds, bw=b.maxx-b.minx+1, bh=b.maxy-b.miny+1;
-  const scanTries=Math.min(400,bw*bh);
+  // With tilt on, spawning is restricted to the fluid's downhill EDGE (see the surface-tension
+  // test below), which is a thin sliver of the wet region — a uniform random scan of only 400
+  // points across the whole bounding box almost never lands on it. More tries when tilted, so
+  // edges are actually found and runs form at a believable rate.
+  const scanTries=Math.min(tiltOn?2200:400,bw*bh);
   const dripChance=0.02*V.dripSize*(tiltOn?(1+gStrength*2):0.4);
-  const wetThresh=tiltOn?(1.15-gStrength*0.35):1.3;
+  /* SURFACE TENSION BREAKS.
+     Drips do not appear in the middle of a puddle — they form where gravity drags pooled liquid
+     past the point its surface tension can hold, i.e. at the pool's DOWNHILL EDGE, and then a
+     finger breaks away and runs. Two problems previously:
+       - the wetness threshold was 1.15 - strength*0.35, i.e. ~0.92 even at full force. Wetness
+         that high only exists for a moment right under the Water tool, and it drops fast once
+         diffusion spreads it, so in practice the condition almost never held and no drips ever
+         spawned. Now scales down properly with force, so a genuinely tilted wet wash drips.
+       - spawn points were picked at random anywhere in the wet region, so when drips did fire
+         they started mid-pool rather than breaking off an edge.
+     The edge test below requires the pixel to be wet AND its downhill neighbour to be
+     noticeably drier — which is exactly the fluid boundary where a bead breaks. */
+  const wetThresh=tiltOn?clamp(0.80-gStrength*0.34,0.30,1.0):1.3;
   for(let k=0;k<scanTries;k++){
     const x=(b.minx+Math.random()*bw)|0, y=(b.miny+Math.random()*bh)|0, i=y*W+x;
     if(L.wet[i]<=wetThresh || L.pd[i]<=0.05) continue;
+    if(tiltOn){
+      // Look one step downhill: a drip only breaks away at the fluid's leading edge.
+      const dx0=Math.round(gDirX*2), dy0=Math.round(gDirY*2);
+      const nx0=x+dx0, ny0=y+dy0;
+      if(nx0<0||ny0<0||nx0>=W||ny0>=H) continue;
+      const downWet=L.wet[ny0*W+nx0];
+      if(downWet > L.wet[i]*0.75) continue; // still inside the pool, tension not broken here
+    }
     if(Math.random()>=dripChance) continue;
     const dirx=tiltOn?gDirX:(Math.random()-0.5)*0.3, diry=tiltOn?gDirY:1;
     L.rivulets.push({
       x,y,dirx,diry,seed:Math.random()*1000,steps:0,
       width:1.2+Math.random()*(1+V.dripSize*0.3),
-      wet:clamp(L.wet[i]*0.8,0,1.6), pigment:clamp(L.pd[i]*0.6,0,2),
+      // Carry a full bead of pigment, not a fraction of one: a real run drags a concentrated
+      // line of colour down with it, which is what makes drips read as drips.
+      wet:clamp(L.wet[i]*0.8,0,1.6), pigment:clamp(L.pd[i]*1.15,0,2),
       pr:L.pr[i],pg:L.pg[i],pb:L.pb[i],
       life:40+V.dripLength*10,
     });
@@ -6111,10 +6183,15 @@ function setTiltFromClientPoint(dial,clientX,clientY){
   const R=rect.width/2-6;
   const angle=Math.atan2(dy,dx)*180/Math.PI;
   const strength=clamp(Math.hypot(dx,dy)/R,0,1);
-  canvasTilt.angle=angle; canvasTilt.strength=strength;
+  // Shift Lock: snap the gravity vector to exact orthogonal/diagonal angles while adjusting.
+  canvasTilt.angle = shiftLockTilt ? Math.round(angle/45)*45 : angle;
+  canvasTilt.strength=strength;
   if(strength>0.04) canvasTilt.enabled=true;
-  updateTiltDial();
+  updateTiltDial(); buildQuickbar();
 }
+let shiftLockTilt=false;
+window.addEventListener('keydown',e=>{ if(e.key==='Shift') shiftLockTilt=true; });
+window.addEventListener('keyup',e=>{ if(e.key==='Shift') shiftLockTilt=false; });
 function wireTiltDial(){
   const dial=document.getElementById('tiltDial'), center=document.getElementById('tiltCenter');
   if(!dial) return;
@@ -6122,7 +6199,8 @@ function wireTiltDial(){
   center.addEventListener('pointerdown',e=>{
     e.stopPropagation();
     canvasTilt.enabled=!canvasTilt.enabled;
-    updateTiltDial();
+    ensureTiltForce(); // otherwise toggling on with force still at 0 has no effect at all
+    updateTiltDial(); buildQuickbar();
   });
   dial.addEventListener('pointerdown',e=>{
     if(e.target===center) return;
@@ -6133,7 +6211,13 @@ function wireTiltDial(){
   dial.addEventListener('pointerup',()=>{ dragging=false; });
   dial.addEventListener('pointercancel',()=>{ dragging=false; });
 }
-function toggleCanvasTilt(){ canvasTilt.enabled=!canvasTilt.enabled; updateTiltDial(); }
+// BUG: canvasTilt.strength defaults to 0, and the simulation gates all gravity on
+// `enabled && strength>0.001`. So switching Tilt ON — via Alt+T, the menu, or clicking the
+// dial's centre disc — did absolutely NOTHING until the user separately discovered that they
+// also had to drag the dial outward to raise the force from zero. Enabling gravity now sets a
+// usable default force if none has been set yet, so the toggle actually tilts the canvas.
+function ensureTiltForce(){ if(canvasTilt.enabled && canvasTilt.strength<0.05) canvasTilt.strength=0.65; }
+function toggleCanvasTilt(){ canvasTilt.enabled=!canvasTilt.enabled; ensureTiltForce(); updateTiltDial(); buildQuickbar(); }
 function rotateTilt90(){ canvasTilt.angle=(canvasTilt.angle+90)%360; updateTiltDial(); }
 function centerAccelerometer(){ canvasTilt.accelOffset={beta:lastAccel.beta,gamma:lastAccel.gamma}; setStatus('Accelerometer centered'); }
 let lastAccel={beta:0,gamma:0};
@@ -6224,7 +6308,7 @@ function buildRecord(){
      <button id="recClear" ${timelapse.frames.length?'':'disabled'}>Clear</button>
    </div>
    <div class="layerToolbar">
-     <button id="recDownloadVideo" ${timelapse.frames.length?'':'disabled'}>⬇ Download Video (.webm)</button>
+     <button id="recDownloadVideo" ${timelapse.frames.length?'':'disabled'}>⬇ Download Video (.mp4)</button>
    </div>
    <div class="layerToolbar">
      <button id="recDownloadFrames" ${timelapse.frames.length?'':'disabled'}>⬇ Download Frames (.jpg)</button>
@@ -6944,18 +7028,32 @@ function exportTimelapseVideo(){
   const octx=off.getContext('2d');
   const fps=8;
   const stream=off.captureStream(fps);
-  let mimeType='video/webm;codecs=vp9';
-  if(!MediaRecorder.isTypeSupported(mimeType)) mimeType=MediaRecorder.isTypeSupported('video/webm')?'video/webm':'';
+  /* Prefer real MP4 (H.264). MediaRecorder in current Chrome/Edge/Safari supports
+     'video/mp4;codecs=avc1', which produces a genuine .mp4 that plays anywhere — the previous
+     code only ever tried WebM, so the download was always a .webm regardless of what the
+     browser could actually encode. WebM is kept strictly as a fallback for browsers with no MP4
+     encoder (notably Firefox), and in that case the file is named .webm rather than handing back
+     an .mp4 that isn't one. The container is always taken from what the recorder actually
+     negotiated (rec.mimeType), never assumed. */
+  const MP4_TYPES=['video/mp4;codecs=avc1.42E01E','video/mp4;codecs=avc1','video/mp4'];
+  const WEBM_TYPES=['video/webm;codecs=vp9','video/webm;codecs=vp8','video/webm'];
+  let mimeType='';
+  for(const t of MP4_TYPES.concat(WEBM_TYPES)){ if(MediaRecorder.isTypeSupported(t)){ mimeType=t; break; } }
   let rec;
   try{ rec=mimeType?new MediaRecorder(stream,{mimeType}):new MediaRecorder(stream); }
   catch(e){ setStatus('Video export failed to start — downloading individual JPG frames instead'); exportTimelapseFrames(); return; }
   const chunks=[];
   rec.ondataavailable=e=>{ if(e.data && e.data.size) chunks.push(e.data); };
   rec.onstop=()=>{
-    const blob=new Blob(chunks,{type:'video/webm'});
-    const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='be-a-rebel-timelapse.webm'; a.click();
+    const actual=(rec.mimeType||mimeType||'video/webm').toLowerCase();
+    const isMp4=actual.indexOf('mp4')>=0;
+    const ext=isMp4?'mp4':'webm';
+    const blob=new Blob(chunks,{type:isMp4?'video/mp4':'video/webm'});
+    const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='be-a-rebel-timelapse.'+ext; a.click();
     setTimeout(()=>URL.revokeObjectURL(a.href),4000);
-    setStatus('Time-lapse video downloaded ('+frames.length+' frames, .webm)');
+    setStatus(isMp4
+      ? 'Time-lapse downloaded as MP4 ('+frames.length+' frames, H.264)'
+      : 'Time-lapse downloaded as .webm ('+frames.length+' frames) — this browser has no MP4 encoder available');
   };
   rec.start();
   setStatus('Encoding time-lapse video from '+frames.length+' frames…');
@@ -8056,6 +8154,22 @@ function buildQuickbar(){
       <input type="range" id="qbPressure" min="0" max="100" step="1" value="${PREFS.pressureSensitivity}">
       <output id="qbPressureOut">${PREFS.pressureSensitivity}%</output></label>
     <div class="qsep"></div>
+    <label class="qslider" title="Canvas paper / surface — changes the paper texture, tooth and absorbency the whole simulation reads from">Paper
+      <select id="qbPaper">${Object.entries(PAPERS).map(([k,p])=>`<option value="${k}" ${k===paperKey?'selected':''}>${p.name}</option>`).join('')}</select></label>
+    <div class="qsep"></div>
+    <button class="qbtn ${symmetry.enabled?'primary':''}" id="qbSym" title="Symmetry — mirror every stroke across the canvas. Choose the mode with the dropdown beside it.">⇋ Symmetry</button>
+    <select id="qbSymMode" title="Symmetry mode">
+      ${[['vertical','Vertical'],['horizontal','Horizontal'],['both','Both'],['radial','Radial']].map(([v,l])=>`<option value="${v}" ${symmetry.mode===v?'selected':''}>${l}</option>`).join('')}
+    </select>
+    <div class="qsep"></div>
+    <button class="qbtn ${(canvasTilt.enabled&&canvasTilt.strength>0.001)?'primary':''}" id="qbTilt" title="Canvas Tilt (Alt+T) — gravity pulls wet pigment and water downhill into runs, pooling and drips">⤡ Tilt</button>
+    <label class="qslider" title="Tilt force — gentle slope near 0, steep rapid runoff near 100">Force
+      <input type="range" id="qbTiltForce" min="0" max="100" step="1" value="${Math.round(canvasTilt.strength*100)}">
+      <output id="qbTiltForceOut">${Math.round(canvasTilt.strength*100)}%</output></label>
+    <label class="qslider" title="Tilt direction in degrees — which way is downhill">Angle
+      <input type="range" id="qbTiltAngle" min="-180" max="180" step="1" value="${Math.round(canvasTilt.angle)}">
+      <output id="qbTiltAngleOut">${Math.round(canvasTilt.angle)}°</output></label>
+    <div class="qsep"></div>
     <button class="qbtn ${showWetOverlay?'primary':''}" id="qbShowWet" title="Show Wet (H) — tint wet areas blue so you can see exactly where the canvas is still wet">💧 Wet</button>
     <button class="qbtn ${naturalColors?'primary':''}" id="qbPigments" title="Pigments mixing mode — mix in Kubelka-Munk subtractive space so blue+yellow makes green instead of grey. Essential for vivid wet-on-wet blends.">🎨 Pigments</button>
     <button class="qbtn" id="qbWetLayer" title="Wet the Whole Layer (Shift+L) — soak the canvas so the next strokes bleed and blend">💧 Wet Layer</button>
@@ -8079,6 +8193,32 @@ function buildQuickbar(){
   if(qpg) qpg.onclick=()=>{ naturalColors=!naturalColors; setStatus('Pigments mixing '+(naturalColors?'ON — subtractive Kubelka-Munk blending':'OFF — standard RGB blending')); buildQuickbar(); };
   const qwl=document.getElementById('qbWetLayer');
   if(qwl) qwl.onclick=()=>{ const L=activeLayer(); if(L){ pushUndo(); wetWholeLayer(L); buildLayersPanel(); } };
+  // Paper / surface selector — previously only reachable inside the Layer Settings panel, which
+  // shipped collapsed, so there was no visible way to change the canvas paper at all.
+  const qpp=document.getElementById('qbPaper');
+  if(qpp) qpp.onchange=e=>{ setPaper(e.target.value); buildLayerSettings(); };
+  // Symmetry — previously only inside the Rulers panel, which also shipped collapsed.
+  const qsy=document.getElementById('qbSym');
+  if(qsy) qsy.onclick=()=>{ symmetry.enabled=!symmetry.enabled; symmetry.cx=symmetry.cx||W/2; symmetry.cy=symmetry.cy||H/2;
+    setStatus('Symmetry '+(symmetry.enabled?('ON — '+symmetry.mode):'OFF')); markFullDirty(); render(true); buildRulers(); buildQuickbar(); };
+  const qsm=document.getElementById('qbSymMode');
+  if(qsm) qsm.onchange=e=>{ symmetry.mode=e.target.value; markFullDirty(); render(true); buildRulers(); };
+  // Canvas Tilt, with force and angle directly on the bar.
+  const qt=document.getElementById('qbTilt');
+  if(qt) qt.onclick=()=>{ toggleCanvasTilt(); setStatus('Canvas Tilt '+(canvasTilt.enabled?('ON — '+Math.round(canvasTilt.angle)+'\u00b0 at '+Math.round(canvasTilt.strength*100)+'% force'):'OFF')); };
+  const qtf=document.getElementById('qbTiltForce');
+  if(qtf) qtf.oninput=e=>{
+    canvasTilt.strength=clamp(+e.target.value/100,0,1);
+    if(canvasTilt.strength>0.02) canvasTilt.enabled=true;
+    const o=document.getElementById('qbTiltForceOut'); if(o) o.textContent=Math.round(canvasTilt.strength*100)+'%';
+    updateTiltDial();
+  };
+  const qta=document.getElementById('qbTiltAngle');
+  if(qta) qta.oninput=e=>{
+    canvasTilt.angle=+e.target.value;
+    const o=document.getElementById('qbTiltAngleOut'); if(o) o.textContent=Math.round(canvasTilt.angle)+'\u00b0';
+    updateTiltDial();
+  };
   document.getElementById('qbUndo').onclick=undo;
   document.getElementById('qbRedo').onclick=redo;
   document.getElementById('qbDry').onclick=dryCanvas;
