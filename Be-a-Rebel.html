@@ -495,6 +495,7 @@ function catIcon(shape){
     case 'mop': case 'wash': return svg('<circle cx="12" cy="12" r="8" stroke-dasharray="2 2"/>');
     case 'liner': return svg('<path d="M4 18L20 6"/>');
     case 'knife': return svg('<path d="M4 16l14-9 2 3-14 9z"/>');
+    case 'rake': return svg('<path d="M4 7h16"/><path d="M7 7v10"/><path d="M11 7v10"/><path d="M15 7v10"/><path d="M19 7v10"/>');
     case 'grunge': return svg('<circle cx="7" cy="8" r="1" fill="currentColor"/><circle cx="13" cy="6" r="1" fill="currentColor"/><circle cx="17" cy="11" r="1" fill="currentColor"/><circle cx="9" cy="14" r="1" fill="currentColor"/><circle cx="15" cy="17" r="1" fill="currentColor"/><circle cx="6" cy="18" r="1" fill="currentColor"/>');
     case 'splat': return svg('<circle cx="8" cy="8" r="1.4" fill="currentColor"/><circle cx="15" cy="6" r="1" fill="currentColor"/><circle cx="17" cy="14" r="1.6" fill="currentColor"/><circle cx="9" cy="16" r="1" fill="currentColor"/>');
     case 'drip': return svg('<path d="M12 3c3 5 4 8 4 11a4 4 0 0 1-8 0c0-3 1-6 4-11z"/>');
@@ -1752,6 +1753,9 @@ function buildBrushesFromReconSpecs(specs,groupName,keyPrefix,defaultTool,defaul
       rotationMode:spec.rotationMode||'trajectory', shapeAngle:spec.shapeAngle||0,
       angleJitterDeg:spec.angleJitterDeg||0, grainSmoothing:!!spec.grainSmoothing,
       randomStart:!!spec.randomStart, randomStamp:!!spec.randomStamp,
+      // 57 is the neutral default that reproduces the engine's original fixed falloff
+      // exponent, so specs that don't mention Edge Softness render exactly as they always did.
+      edgeSoftness:spec.edgeSoftness!=null?spec.edgeSoftness:57,
       key, reconstructedFromSheet:true, reconstructionNote:spec.note, defaultColor:spec.defaultColor||null,
     };
     if(spec.shapeGen){
@@ -1772,6 +1776,8 @@ function buildReconstructedBrushLibrary(){
   buildBrushesFromReconSpecs(PENCIL_RECON_SPECS,null,'reconpencil','pencil','dryMedia'); // each spec carries its own sub-group (Charcoal/Digital/Dry Media/Scratches)
   buildBrushesFromReconSpecs(MARKER_RECON_SPECS,'Reconstructed Marker (10-brush pack)','reconmarker','marker','marker');
   buildBrushesFromReconSpecs(PASTEL_RECON_SPECS,null,'reconpastel','pastel','dryMedia'); // each spec carries its own sub-group (Pastel Dry/Pastel Oil & Wax/Pastel Texture)
+  buildBrushesFromReconSpecs(AIRBRUSH_RECON_SPECS,'Reconstructed Airbrush (10-brush pack)','reconair','airbrush','airbrush');
+  buildBrushesFromReconSpecs(OIL_RECON_SPECS,null,'reconoil','oil','oil'); // each spec carries its own sub-group (Round/Bristle/Flat/Filbert/Liner/Grunge/Knife/Rake/Dabber)
 }
 /* =========================================================================
    PENCIL RECONSTRUCTION — 30 brushes, from the user's Rebelle Pencil
@@ -2197,6 +2203,370 @@ const PASTEL_RECON_SPECS=[
   scatter:5,rotationMode:'trajectory',grainGen:['Scratches',{density:7,detail:7,contrast:7}],smudgeOnStroke:true,smudgeDensity:95,grainSmoothing:false,
   sizeBehavior:'custom',sizeCurve:'oilPastel',opacityBehavior:'custom',opacityCurve:'oilPastel',
   note:'More aggressive scrape \u2014 higher grain/scatter/Smudge Density than Wax Scrape'},
+];
+/* =========================================================================
+   AIRBRUSH RECONSTRUCTION — 10 brushes, from the user's Airbrush test sheet
+   (top section, two rows of soft sprayed circular marks) plus a Brush
+   Creator reconstruction. Same honest framing as every table before it:
+   a VISUAL approximation of the marks, not a claim of Rebelle's real
+   stored preset numbers.
+   Airbrush deliberately uses a DIFFERENT volume model from Oil & Acrylic
+   below, exactly as the source notes: Rebelle's Airbrush is driven by
+   Size / Opacity / Pressure (no Loading, no Oiliness), and this engine
+   already matches that — TOOL_BIAS.airbrush is {waterMul:0, pigmentMul:.55,
+   subtractive:true, soft:true}, i.e. no water/wetness at all, reduced
+   pigment per pass for light sprayable coverage, and `soft:true` which
+   disables the per-pixel turbulence noise every other wet-media brush
+   gets, giving a smooth spray instead of a grainy wash. Airbrush routes
+   through depositWet() (not depositOil()), so it gets the full set of
+   jitter/scatter/rotation/grain-smoothing/curve mechanics.
+   Field mapping:
+     - Size -> sizePx at 2x the source's number (50-110px), Max Size ->
+       maxSizePx 1:1 (180-500px). This 2x factor is an explicit VISUAL
+       CALIBRATION arrived at by painting and comparing against the sample
+       sheet, not something derived from the source — stated plainly rather
+       than dressed up. Both alternatives were tried and measured first:
+       reading Size as a percentage OF Max Size gave 45-250px, where a
+       single spray swamped the area the sheet devotes to it; taking Size
+       literally (25-55px) gave marks too small to develop the wide soft
+       gradient the sheet's clouds clearly show. 2x lands the sprays at the
+       ~100px the reference marks actually occupy.
+     - Opacity(%) -> opacity(0-1). Water is 0 for all (inert for this tool
+       anyway, since TOOL_BIAS.airbrush sets waterMul:0).
+     - Falloff tables (the source gives 5-point center/25%/50%/75%/edge
+       percentages per brush) -> brush.edgeSoftness, a REAL new per-brush
+       falloff control added for this table: it drives the actual exponent
+       used in depositWet's coverage curve (edgeSoftness 0 -> exponent 2.6,
+       a tight punchy spot; 100 -> exponent 0.5, a broad photographic
+       cloud). This is an exponent-based APPROXIMATION of those 5-point
+       tables, NOT a literal piecewise curve through those exact
+       breakpoints — the shape of the curve is right, the individual
+       breakpoint percentages are not reproduced exactly. Values chosen to
+       match the source's own Edge column: Very soft 95, Tight 65,
+       Medium 78, Soft 88, Hard 52, Extremely soft 100.
+     - Size/Opacity/Spacing Jitter, Scatter, Grain Smoothing, Random
+       Start/Stamp -> the real fields of those names (all genuinely applied
+       per-dab; see depositWet()/paint()/footprint()).
+     - Rotation: None -> rotationMode:'none' for the whole family, per the
+       Airbrush Master spec. For a radially symmetric spray this is also
+       the physically sensible choice, and it means the marks don't rotate
+       to chase stroke direction.
+     - Pressure -> Size/Opacity (+10..+30) -> the established threshold
+       convention used by the earlier tables ('pressure' for >=40,
+       'pressure-soft' for 15-39, 'constant' for <15). The source did NOT
+       provide a named pressure-curve table for Airbrush (it gave those only
+       for Marker/Hard Pastel/Soft Pastel/Oil Pastel/Powder), so no 'custom'
+       curve is invented here — EXCEPT for Dust and Powder, which reuse the
+       source's own 'powder' curve since they are the same granular medium
+       it was written for (it never reaches full saturation even at maximum
+       pressure, which is exactly right for sprayed powder).
+     - Grain Strength(%) -> grain(0-1) + a matching real procedural preset:
+       Soft Noise for the near-smooth sprays (grain 5-15, where any
+       structured pattern would read as wrong), Fine Sponge for the mid
+       range (30-40), Spatter Dots for the granular ones (55-85).
+   Not implemented (no engine equivalent — stated rather than faked): the
+   source's separate "Pressure" PROPERTY (a 45-60 scalar shown next to Size
+   and Opacity). This engine has no brush-level pressure-scaling constant;
+   pressure response here comes from the sizeBehavior/opacityBehavior curves
+   plus the live stylus pressure signal, so that scalar has no home.
+   ========================================================================= */
+const AIRBRUSH_RECON_SPECS=[
+ {name:'Recon Airbrush Soft',shape:'round',sizePx:110,maxSizePx:450,opacity:0.45,water:0,grain:0.05,flow:0.473,spacing:8,
+  sizeJitter:4,opacityJitter:5,scatter:8,edgeSoftness:95,rotationMode:'none',
+  grainGen:['Soft Noise',{density:2,detail:2,contrast:2}],smudgeOnStroke:false,grainSmoothing:true,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',
+  note:'The large, very soft grey cloud in the top row \u2014 Edge Softness 95 gives the almost photographic airbrush falloff; grain kept at 0.05 so the spray reads as smooth tone, not texture'},
+ {name:'Recon Airbrush Hard',shape:'round',sizePx:70,maxSizePx:280,opacity:0.7,water:0,grain:0.1,flow:0.735,spacing:7,
+  sizeJitter:3,opacityJitter:5,scatter:5,edgeSoftness:65,rotationMode:'none',
+  grainGen:['Soft Noise',{density:2,detail:3,contrast:3}],smudgeOnStroke:false,grainSmoothing:true,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',
+  note:'The darker, tighter-centred second mark in the top row \u2014 Edge Softness 65 concentrates the coverage into a defined dark spot instead of a diffuse cloud'},
+ {name:'Recon Airbrush Grain',shape:'round',sizePx:70,maxSizePx:350,opacity:0.55,water:0,grain:0.55,flow:0.578,spacing:15,
+  sizeJitter:8,opacityJitter:20,spacingJitter:8,scatter:25,edgeSoftness:78,rotationMode:'none',
+  randomStart:true,randomStamp:true,
+  grainGen:['Spatter Dots',{density:6,detail:6,contrast:6}],smudgeOnStroke:false,grainSmoothing:false,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',
+  note:'The visibly speckled circular mark near the centre of the top section \u2014 Grain Smoothing OFF plus Random Start/Stamp keeps the speckle irregular rather than a repeating stamp pattern'},
+ {name:'Recon Airbrush Dust',shape:'round',sizePx:80,maxSizePx:380,opacity:0.45,water:0,grain:0.7,flow:0.473,spacing:20,
+  sizeJitter:15,opacityJitter:20,spacingJitter:12,scatter:35,edgeSoftness:88,rotationMode:'none',
+  randomStart:true,randomStamp:true,
+  grainGen:['Spatter Dots',{density:7,detail:7,contrast:6}],smudgeOnStroke:false,grainSmoothing:false,
+  sizeBehavior:'pressure-soft',opacityBehavior:'custom',opacityCurve:'powder',
+  note:'The softer granular cloud \u2014 reuses the source\u2019s own Powder pressure curve (never fully saturates even at max pressure), which is the correct behaviour for sprayed granular media'},
+ {name:'Recon Airbrush Powder',shape:'round',sizePx:84,maxSizePx:420,opacity:0.4,water:0,grain:0.85,flow:0.42,spacing:25,
+  sizeJitter:20,opacityJitter:25,spacingJitter:15,scatter:50,edgeSoftness:88,rotationMode:'none',
+  randomStamp:true,
+  grainGen:['Spatter Dots',{density:8,detail:8,contrast:7}],smudgeOnStroke:false,grainSmoothing:false,
+  sizeBehavior:'pressure-soft',opacityBehavior:'custom',opacityCurve:'powder',
+  note:'The most granular of the family \u2014 highest Scatter (50) and grain (0.85); the source recommends this one for smoky graphite/charcoal-style airbrush shading'},
+ {name:'Recon Airbrush Soft Grain',shape:'round',sizePx:70,maxSizePx:320,opacity:0.6,water:0,grain:0.4,flow:0.63,spacing:12,
+  sizeJitter:5,opacityJitter:12,scatter:15,edgeSoftness:88,rotationMode:'none',
+  grainGen:['Fine Sponge',{density:4,detail:5,contrast:4}],smudgeOnStroke:false,grainSmoothing:true,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',
+  note:'The darker fuzzy mark in the second row \u2014 mid-range grain with Smoothing ON, so it is textured but still soft-edged rather than speckled'},
+ {name:'Recon Airbrush Dense',shape:'round',sizePx:80,maxSizePx:300,opacity:0.8,water:0,grain:0.15,flow:0.84,spacing:7,
+  sizeJitter:4,opacityJitter:5,scatter:5,edgeSoftness:52,rotationMode:'none',
+  grainGen:['Soft Noise',{density:3,detail:3,contrast:3}],smudgeOnStroke:false,grainSmoothing:true,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',
+  note:'The strong dark circular mark \u2014 lowest Edge Softness (52) and highest opacity (0.8) in the family, i.e. the hardest-edged, most saturated spray'},
+ {name:'Recon Airbrush Textured',shape:'round',sizePx:76,maxSizePx:330,opacity:0.65,water:0,grain:0.65,flow:0.683,spacing:18,
+  sizeJitter:12,opacityJitter:15,scatter:25,edgeSoftness:78,rotationMode:'none',
+  grainGen:['Spatter Dots',{density:6,detail:7,contrast:6}],smudgeOnStroke:false,grainSmoothing:false,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',
+  note:'Between Soft Grain and Powder \u2014 clearly textured but still holding a coherent sprayed shape'},
+ {name:'Recon Airbrush Fine',shape:'round',sizePx:50,maxSizePx:180,opacity:0.55,water:0,grain:0.3,flow:0.578,spacing:12,
+  sizeJitter:5,opacityJitter:10,scatter:15,edgeSoftness:78,rotationMode:'none',
+  grainGen:['Fine Sponge',{density:3,detail:4,contrast:3}],smudgeOnStroke:false,grainSmoothing:true,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',
+  note:'Small controlled spray \u2014 smallest brush in the family (45px) with the strongest Pressure->Size of the set per the source (+30), for detail work'},
+ {name:'Recon Airbrush Soft Fade',shape:'round',sizePx:100,maxSizePx:500,opacity:0.3,water:0,grain:0.03,flow:0.315,spacing:6,
+  sizeJitter:3,opacityJitter:5,scatter:5,edgeSoftness:100,rotationMode:'none',
+  grainGen:['Soft Noise',{density:1,detail:1,contrast:1}],smudgeOnStroke:false,grainSmoothing:true,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',
+  note:'The smoothest of the family \u2014 Edge Softness at maximum (100) and the lowest opacity (0.3); behaves like a Photoshop-style soft airbrush for gradual tonal build-up'},
+];
+/* =========================================================================
+   OIL & ACRYLIC RECONSTRUCTION — 30 brushes, from the user's Oil & Acrylic
+   test sheet (lower section, ~28 distinct painterly marks in three bands)
+   matched against the real Escape Motions Oil & Acrylic library families the
+   user independently verified: Round, Flat, Bristle, Liner, Filbert, Knife,
+   Rake, Dabber and Grunge. Organised into those 9 sub-groups via spec.group
+   (the same mechanism the Pencil and Pastel tables use).
+   As always: a best-effort VISUAL reconstruction, not a claim of Rebelle's
+   real stored numeric values.
+   This family uses a genuinely different volume model from every other table
+   in this file, exactly as the source states: Oil & Acrylic is driven by
+   Size / Loading / Oiliness / Pressure rather than Opacity / Water, and it
+   routes through depositOil() (multi-bristle + impasto) instead of
+   depositWet(). Both of those are pre-existing real engine facts, not
+   something invented for this table:
+     - Loading -> brush.loading (0-100): scales how much paint each bristle
+       deposits per dab, and is the ONLY paint-volume control that varies
+       across this table — opacity and flow are pinned to the same constants
+       for all 30 specs (0.5 / 0.55) purely as a deposit calibration, so
+       Loading alone differentiates them. Those constants are deliberately
+       the same ones the engine's own built-in oil brushes use: an earlier
+       draft set opacity:1 and flow:1 to make Loading mathematically the
+       sole term, but that deposits ~4.2x more paint per dab than a built-in
+       oil brush (amountBase 0.95 vs 0.226), which saturated every stroke to
+       flat solid black within a few dabs and hid all grain and bristle
+       structure entirely. Verified by measurement, then corrected.
+     - Oiliness -> brush.oiliness (0-100): drives how strongly fresh paint
+       mixes into paint already on the canvas (depositOil's mixT term), i.e.
+       dry brushes sit on top and wet/oily brushes blend and smear. This is
+       the single most important axis separating the dry / normal / oily /
+       grunge rows of the source's own control matrix.
+     - Pressure -> Loading -> the opacityBehavior curve. NOTE: this only
+       started having any effect as of the same change that added this table
+       — depositOil previously never evaluated a loading/opacity curve at
+       all, so pressing harder changed an oil stroke's WIDTH but never how
+       much paint it laid down. See the BUG FIX comment in depositOil().
+     - Pressure -> Size (+20..+75) -> sizeBehavior, via the established
+       threshold convention ('pressure' for >=40, 'pressure-soft' for 15-39).
+       Only Round Hard (+45) and Liner (+75) clear the >=40 bar, which
+       matches the source's emphasis on Liner as the most pressure-driven
+       brush of the set.
+     - Size -> sizePx directly (30-50px), Max Size -> maxSizePx (80-350px),
+       the same 1:1 mapping used by the Marker/Pastel/Airbrush tables. Note
+       this engine's real painted extent is considerably WIDER than sizePx,
+       because depositOil offsets each bristle by br.ox*size/60 and then
+       gives it its own radius of size*br.r*0.5 — e.g. Fat Bristle at
+       sizePx 50 covers roughly 90px end to end, which is what makes these
+       match the ~90px patches in the sample sheet. An earlier draft used
+       Size% x MaxSize (giving 72-176px) and measured a 249px extent for a
+       single Fat Bristle mark, which merged neighbouring marks into one
+       black mass; corrected after painting and measuring it.
+     - Size Jitter / Loading Jitter / Spacing Jitter / Scatter / Grain
+       Smoothing / Random Start / Random Stamp -> the real fields of those
+       names. Size Jitter, Loading Jitter (which reuses the opacityJitter
+       field, since Loading is this medium's volume property) and Grain
+       Smoothing were all silently IGNORED by depositOil until the change
+       that added this table; they are honoured now.
+     - Shape -> brush.shape, which for this engine selects the BRISTLE
+       LAYOUT in makeBristles() (depositOil never calls footprint()): round =
+       tight 7-bristle cluster, filbert = wider oval cluster, liner = 4
+       bristles in a narrow row, flat = 6 spread across a wide flat edge,
+       fan = 11 frayed, rake = 6 well-separated parallel lines, knife = a
+       single squashed blade with boosted impasto, grunge = 14 scattered,
+       splat = 10 thrown wide. The liner/filbert/splat layouts were added
+       alongside this table — before that they all fell through to the same
+       generic circular cluster, so oil Round/Filbert/Liner/Splat brushes
+       were literally identical in layout no matter what shape they declared.
+     - Grain Strength(%) -> grain(0-1) + a real procedural preset per
+       character: Fine Sponge for smooth/oily paint, Coarse Sponge for
+       ordinary dry paint and bristle work, Granular Mineral for the
+       grittiest dry marks (Rough Dry, Knife Dry, Grunge 4), Spatter Dots for
+       the broken/scattered Grunge and Scatter families, Chisel Streaks for
+       the directional Rake brushes, Scratches for Shred.
+     - Smudge ON/OFF + Density -> smudgeOnStroke/smudgeDensity, following
+       the source's control matrix (dry -> OFF, normal/oily/bristle -> ON,
+       grunge -> OFF).
+   Not implemented (stated, not faked): brush.edgeSoftness has no effect on
+   this engine — depositOil uses a fixed linear per-bristle falloff, and the
+   source only specified falloff tables for the Airbrush family, so no oil
+   spec sets it. The source's separate "Pressure" PROPERTY scalar (55-70)
+   likewise has no engine equivalent, same as noted for Airbrush above.
+   ========================================================================= */
+const OIL_RECON_SPECS=[
+ // --- Round (6) ---
+ {name:'Recon Round Hard',group:'Round',shape:'round',sizePx:40,maxSizePx:180,opacity:0.5,flow:0.55,water:0,loading:95,oiliness:20,grain:0.2,pigment:0.3,spacing:8,
+  sizeJitter:5,opacityJitter:3,scatter:0,rotationMode:'trajectory',
+  grainGen:['Fine Sponge',{density:2,detail:3,contrast:2}],smudgeOnStroke:false,grainSmoothing:true,
+  sizeBehavior:'pressure',opacityBehavior:'pressure-soft',
+  note:'The dense black strokes at the top-right of the sheet \u2014 Loading 95 with Oiliness only 20 gives a solid opaque mark that sits on the surface instead of blending into it'},
+ {name:'Recon Round Soft',group:'Round',shape:'round',sizePx:45,maxSizePx:220,opacity:0.5,flow:0.55,water:0,loading:65,oiliness:65,grain:0.25,pigment:0.28,spacing:10,
+  sizeJitter:5,opacityJitter:8,rotationMode:'trajectory',
+  grainGen:['Fine Sponge',{density:3,detail:3,contrast:3}],smudgeOnStroke:true,smudgeDensity:80,grainSmoothing:true,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',
+  note:'Soft rounded dark marks \u2014 mid Loading with mid-high Oiliness so edges blend rather than cut'},
+ {name:'Recon Round Oily',group:'Round',shape:'round',sizePx:45,maxSizePx:230,opacity:0.5,flow:0.55,water:0,loading:80,oiliness:85,grain:0.2,pigment:0.32,spacing:8,
+  sizeJitter:6,opacityJitter:5,rotationMode:'trajectory',
+  grainGen:['Fine Sponge',{density:2,detail:3,contrast:2}],smudgeOnStroke:true,smudgeDensity:90,grainSmoothing:true,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',
+  note:'Behaves like genuinely wet oil paint \u2014 Oiliness 85 plus Smudge Density 90 means each pass drags and remixes what is already down'},
+ {name:'Recon Round Dry',group:'Round',shape:'round',sizePx:42,maxSizePx:200,opacity:0.5,flow:0.55,water:0,loading:65,oiliness:10,grain:0.65,pigment:0.3,spacing:18,
+  sizeJitter:15,opacityJitter:15,spacingJitter:8,scatter:4,rotationMode:'trajectory',
+  grainGen:['Coarse Sponge',{density:6,detail:6,contrast:6}],smudgeOnStroke:false,grainSmoothing:false,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',
+  note:'The important opposite of Round Oily \u2014 Oiliness 10, Smudge OFF, wide spacing and coarse grain give the broken dry-oil mark'},
+ {name:'Recon Rough Dry',group:'Round',shape:'round',sizePx:45,maxSizePx:260,opacity:0.5,flow:0.55,water:0,loading:65,oiliness:5,grain:0.8,pigment:0.34,spacing:28,
+  sizeJitter:20,opacityJitter:18,spacingJitter:15,scatter:8,rotationMode:'trajectory',
+  grainGen:['Granular Mineral',{density:7,detail:7,contrast:7}],smudgeOnStroke:false,grainSmoothing:false,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',
+  note:'One of the most useful brushes for the look of this sheet \u2014 lowest Oiliness (5) in the whole table, widest spacing of the Round family, Granular Mineral grain for maximum grit'},
+ {name:'Recon Rough Oily',group:'Round',shape:'round',sizePx:45,maxSizePx:280,opacity:0.5,flow:0.55,water:0,loading:75,oiliness:75,grain:0.6,pigment:0.32,spacing:18,
+  sizeJitter:15,opacityJitter:10,scatter:5,rotationMode:'trajectory',
+  grainGen:['Coarse Sponge',{density:6,detail:6,contrast:6}],smudgeOnStroke:true,smudgeDensity:85,grainSmoothing:false,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',
+  note:'Same rough structure as Rough Dry but with far more paint movement \u2014 Oiliness 75 and Smudge 85 instead of a dry deposit'},
+ // --- Bristle (4) ---
+ {name:'Recon Fat Bristle',group:'Bristle',shape:'flat',sizePx:50,maxSizePx:280,opacity:0.5,flow:0.55,water:0,loading:80,oiliness:40,grain:0.45,pigment:0.3,spacing:15,
+  sizeJitter:10,opacityJitter:8,scatter:4,rotationMode:'trajectory',
+  grainGen:['Coarse Sponge',{density:5,detail:5,contrast:5}],smudgeOnStroke:true,smudgeDensity:75,grainSmoothing:false,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',
+  note:'Broad hairy strokes \u2014 flat shape so the oil engine spreads 6 separate bristles across the width rather than stamping one solid round blob'},
+ {name:'Recon Bristle Soft',group:'Bristle',shape:'round',sizePx:45,maxSizePx:300,opacity:0.5,flow:0.55,water:0,loading:65,oiliness:60,grain:0.4,pigment:0.28,spacing:12,
+  sizeJitter:12,opacityJitter:8,scatter:5,rotationMode:'trajectory',
+  grainGen:['Fine Sponge',{density:4,detail:4,contrast:4}],smudgeOnStroke:true,smudgeDensity:80,grainSmoothing:true,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',
+  note:'The soft, blended member of the bristle family'},
+ {name:'Recon Bristle Hairy',group:'Bristle',shape:'fan',sizePx:45,maxSizePx:300,opacity:0.5,flow:0.55,water:0,loading:75,oiliness:45,grain:0.6,pigment:0.32,spacing:20,
+  sizeJitter:18,opacityJitter:12,spacingJitter:8,scatter:8,rotationMode:'trajectory',
+  grainGen:['Coarse Sponge',{density:6,detail:7,contrast:6}],smudgeOnStroke:true,smudgeDensity:70,grainSmoothing:false,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',
+  note:'Visible hairy/frayed edges \u2014 fan shape gives 11 thin bristles spread wide, which is what produces the frayed edge rather than grain alone'},
+ {name:'Recon Bristle Ribbon',group:'Bristle',shape:'flat',sizePx:50,maxSizePx:320,opacity:0.5,flow:0.55,water:0,loading:80,oiliness:50,grain:0.35,pigment:0.3,spacing:12,
+  sizeJitter:8,scatter:2,rotationMode:'trajectory',
+  grainGen:['Fine Sponge',{density:3,detail:4,contrast:3}],smudgeOnStroke:true,smudgeDensity:75,grainSmoothing:true,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',
+  note:'Wider ribbon-shaped bristle brush \u2014 widest of the Bristle group with low jitter, so it reads as a clean continuous ribbon'},
+ // --- Flat (3) ---
+ {name:'Recon Flat',group:'Flat',shape:'flat',sizePx:45,maxSizePx:280,opacity:0.5,flow:0.55,water:0,loading:85,oiliness:35,grain:0.25,pigment:0.3,spacing:10,
+  sizeJitter:5,opacityJitter:5,scatter:1,rotationMode:'trajectory',
+  grainGen:['Fine Sponge',{density:3,detail:3,contrast:3}],smudgeOnStroke:true,smudgeDensity:75,grainSmoothing:true,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',
+  note:'The large clean rectangular strokes in the upper band of the sheet'},
+ {name:'Recon Flat Dry',group:'Flat',shape:'flat',sizePx:45,maxSizePx:300,opacity:0.5,flow:0.55,water:0,loading:70,oiliness:10,grain:0.7,pigment:0.32,spacing:20,
+  sizeJitter:15,opacityJitter:12,spacingJitter:8,scatter:4,rotationMode:'trajectory',
+  grainGen:['Coarse Sponge',{density:7,detail:6,contrast:6}],smudgeOnStroke:false,grainSmoothing:false,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',
+  note:'Corresponds to several of the dry textured strokes in the middle band \u2014 Oiliness 10 with Smudge OFF'},
+ {name:'Recon Flat Oily',group:'Flat',shape:'flat',sizePx:50,maxSizePx:300,opacity:0.5,flow:0.55,water:0,loading:90,oiliness:80,grain:0.2,pigment:0.34,spacing:8,
+  sizeJitter:5,opacityJitter:5,scatter:1,rotationMode:'trajectory',
+  grainGen:['Fine Sponge',{density:2,detail:3,contrast:2}],smudgeOnStroke:true,smudgeDensity:90,grainSmoothing:true,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',
+  note:'The direct opposite of Flat Dry \u2014 Loading 90 / Oiliness 80 for thick wet paint that smears as it goes'},
+ // --- Filbert (2) ---
+ {name:'Recon Filbert',group:'Filbert',shape:'filbert',sizePx:45,maxSizePx:250,opacity:0.5,flow:0.55,water:0,loading:80,oiliness:45,grain:0.3,pigment:0.3,spacing:10,
+  sizeJitter:7,opacityJitter:6,rotationMode:'trajectory',
+  grainGen:['Fine Sponge',{density:3,detail:4,contrast:3}],smudgeOnStroke:true,smudgeDensity:75,grainSmoothing:true,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',
+  note:'Oval tip with a flattened edge \u2014 the filbert bristle layout (wider than tall) is what distinguishes this from Round in this engine'},
+ {name:'Recon Filbert Dry',group:'Filbert',shape:'filbert',sizePx:45,maxSizePx:250,opacity:0.5,flow:0.55,water:0,loading:65,oiliness:12,grain:0.7,pigment:0.32,spacing:22,
+  sizeJitter:15,opacityJitter:15,scatter:5,rotationMode:'trajectory',
+  grainGen:['Coarse Sponge',{density:7,detail:6,contrast:7}],smudgeOnStroke:false,grainSmoothing:false,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',
+  note:'The dry counterpart of Filbert'},
+ // --- Liner (1) ---
+ {name:'Recon Liner',group:'Liner',shape:'liner',sizePx:30,maxSizePx:80,opacity:0.5,flow:0.55,water:0,loading:90,oiliness:35,grain:0.15,pigment:0.26,spacing:6,
+  sizeJitter:3,opacityJitter:3,scatter:0,rotationMode:'trajectory',
+  grainGen:['Fine Sponge',{density:2,detail:2,contrast:2}],smudgeOnStroke:false,grainSmoothing:true,
+  sizeBehavior:'pressure',opacityBehavior:'pressure-soft',
+  note:'The narrow detail strokes \u2014 the most pressure-responsive brush in the table (source gives Pressure->Size +75, the only value high enough to warrant the full \u2018pressure\u2019 curve alongside Round Hard)'},
+ // --- Grunge (8) ---
+ {name:'Recon Grunge',group:'Grunge',shape:'grunge',sizePx:45,maxSizePx:300,opacity:0.5,flow:0.55,water:0,loading:70,oiliness:25,grain:0.85,pigment:0.34,spacing:30,
+  sizeJitter:25,opacityJitter:20,spacingJitter:20,scatter:25,randomStart:true,randomStamp:true,rotationMode:'trajectory',
+  grainGen:['Spatter Dots',{density:7,detail:7,contrast:7}],smudgeOnStroke:false,grainSmoothing:false,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',
+  note:'Start of the heavily textured marks \u2014 grunge shape scatters 14 bristles, and Random Start/Stamp keeps successive dabs from repeating a recognisable pattern'},
+ {name:'Recon Grunge 2',group:'Grunge',shape:'grunge',sizePx:48,maxSizePx:320,opacity:0.5,flow:0.55,water:0,loading:75,oiliness:35,grain:0.75,pigment:0.34,spacing:22,
+  sizeJitter:20,opacityJitter:15,spacingJitter:12,scatter:20,rotationMode:'trajectory',
+  grainGen:['Spatter Dots',{density:6,detail:7,contrast:6}],smudgeOnStroke:true,smudgeDensity:70,grainSmoothing:false,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',
+  note:'Slightly wetter and tighter than Grunge \u2014 the only Grunge variant with Smudge ON, per the source'},
+ {name:'Recon Grunge 3',group:'Grunge',shape:'grunge',sizePx:45,maxSizePx:300,opacity:0.5,flow:0.55,water:0,loading:65,oiliness:15,grain:0.9,pigment:0.36,spacing:35,
+  sizeJitter:30,opacityJitter:20,spacingJitter:20,scatter:35,randomStamp:true,rotationMode:'trajectory',
+  grainGen:['Spatter Dots',{density:8,detail:8,contrast:7}],smudgeOnStroke:false,grainSmoothing:false,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',
+  note:'More fragmented than Grunge 2 \u2014 wider spacing and scatter break the mark into separate clumps'},
+ {name:'Recon Grunge 4',group:'Grunge',shape:'grunge',sizePx:50,maxSizePx:280,opacity:0.5,flow:0.55,water:0,loading:95,oiliness:20,grain:0.85,pigment:0.38,spacing:18,
+  sizeJitter:18,opacityJitter:10,scatter:15,rotationMode:'trajectory',
+  grainGen:['Granular Mineral',{density:7,detail:7,contrast:8}],smudgeOnStroke:false,grainSmoothing:false,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',
+  note:'Heavy black texture \u2014 Loading 95 with tight spacing gives the almost-solid black textured block in the sheet, while Granular Mineral grain keeps it from going completely flat'},
+ {name:'Recon Shred',group:'Grunge',shape:'rake',sizePx:45,maxSizePx:250,opacity:0.5,flow:0.55,water:0,loading:70,oiliness:15,grain:0.9,pigment:0.34,spacing:25,
+  sizeJitter:18,opacityJitter:12,spacingJitter:12,scatter:10,rotationMode:'trajectory',
+  grainGen:['Scratches',{density:7,detail:8,contrast:7}],smudgeOnStroke:false,grainSmoothing:false,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',
+  note:'The scratchy shredded marks \u2014 uses the rake bristle layout (separated parallel lines) plus Scratches grain, which together give torn parallel streaks rather than a filled band'},
+ {name:'Recon Scatter',group:'Grunge',shape:'splat',sizePx:45,maxSizePx:280,opacity:0.5,flow:0.55,water:0,loading:60,oiliness:20,grain:0.8,pigment:0.32,spacing:35,
+  sizeJitter:30,opacityJitter:25,spacingJitter:25,scatter:50,randomStart:true,randomStamp:true,rotationMode:'trajectory',
+  grainGen:['Spatter Dots',{density:7,detail:7,contrast:6}],smudgeOnStroke:false,grainSmoothing:false,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',
+  note:'The oil-paint equivalent of the granular Pastel Texture brushes \u2014 splat layout throws 10 small bristles wide, and Scatter 50 spreads the dabs off the stroke path'},
+ {name:'Recon Scatter 2',group:'Grunge',shape:'splat',sizePx:50,maxSizePx:320,opacity:0.5,flow:0.55,water:0,loading:55,oiliness:25,grain:0.85,pigment:0.32,spacing:40,
+  sizeJitter:35,opacityJitter:25,scatter:65,randomStamp:true,rotationMode:'trajectory',
+  grainGen:['Spatter Dots',{density:8,detail:7,contrast:7}],smudgeOnStroke:false,grainSmoothing:false,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',
+  note:'Looser than Scatter \u2014 Scatter 65 with lower Loading, so individual dabs read as separate flecks'},
+ {name:'Recon Scatter 3',group:'Grunge',shape:'splat',sizePx:50,maxSizePx:350,opacity:0.5,flow:0.55,water:0,loading:50,oiliness:15,grain:0.95,pigment:0.32,spacing:45,
+  sizeJitter:40,opacityJitter:30,spacingJitter:30,scatter:80,randomStart:true,randomStamp:true,rotationMode:'trajectory',
+  grainGen:['Spatter Dots',{density:9,detail:8,contrast:8}],smudgeOnStroke:false,grainSmoothing:false,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',
+  note:'The most chaotic brush in the entire table \u2014 highest Scatter (80), Size Jitter (40) and grain (0.95) anywhere in this file'},
+ // --- Knife (2) ---
+ {name:'Recon Knife Dry',group:'Knife',shape:'knife',sizePx:45,maxSizePx:250,opacity:0.5,flow:0.55,water:0,loading:70,oiliness:5,grain:0.7,pigment:0.5,spacing:15,
+  sizeJitter:8,opacityJitter:8,scatter:2,rotationMode:'trajectory',
+  grainGen:['Granular Mineral',{density:7,detail:6,contrast:7}],smudgeOnStroke:false,grainSmoothing:false,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',
+  note:'Wide dry palette-knife edge \u2014 the knife shape is a single squashed blade with boosted impasto height, so it builds visible ridges; Oiliness 5 keeps it scraping rather than smearing'},
+ {name:'Recon Knife Oily',group:'Knife',shape:'knife',sizePx:50,maxSizePx:280,opacity:0.5,flow:0.55,water:0,loading:90,oiliness:90,grain:0.2,pigment:0.55,spacing:8,
+  sizeJitter:5,opacityJitter:5,rotationMode:'trajectory',
+  grainGen:['Fine Sponge',{density:2,detail:3,contrast:2}],smudgeOnStroke:true,smudgeDensity:95,grainSmoothing:true,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',
+  note:'The broad smeared oil strokes \u2014 highest Oiliness (90) and Smudge Density (95) in the table, with the heaviest impasto for thick buttery ridges'},
+ // --- Rake (2) ---
+ {name:'Recon Rake Oily',group:'Rake',shape:'rake',sizePx:45,maxSizePx:260,opacity:0.5,flow:0.55,water:0,loading:75,oiliness:70,grain:0.45,pigment:0.3,spacing:12,
+  sizeJitter:8,scatter:3,rotationMode:'trajectory',
+  grainGen:['Chisel Streaks',{density:5,detail:5,contrast:5}],smudgeOnStroke:true,smudgeDensity:75,grainSmoothing:false,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',
+  note:'Multiple parallel bristle lines in wet paint \u2014 6 well-separated rake bristles plus directional Chisel Streaks grain; Oiliness 70 lets the parallel lines blend into what is underneath'},
+ {name:'Recon Rake Sharp',group:'Rake',shape:'rake',sizePx:40,maxSizePx:220,opacity:0.5,flow:0.55,water:0,loading:65,oiliness:25,grain:0.55,pigment:0.3,spacing:15,
+  sizeJitter:5,scatter:1,rotationMode:'trajectory',
+  grainGen:['Chisel Streaks',{density:6,detail:6,contrast:6}],smudgeOnStroke:false,grainSmoothing:false,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',
+  note:'The dry, crisp rake \u2014 Smudge OFF and low Oiliness keep the individual comb lines clean and separate; the source recommends this one for hair, fur and dry texture'},
+ // --- Dabber (2) ---
+ {name:'Recon Dabber',group:'Dabber',shape:'filbert',sizePx:45,maxSizePx:250,opacity:0.5,flow:0.55,water:0,loading:80,oiliness:50,grain:0.45,pigment:0.3,spacing:35,
+  sizeJitter:15,opacityJitter:10,spacingJitter:15,scatter:5,rotationMode:'trajectory',
+  grainGen:['Coarse Sponge',{density:5,detail:5,contrast:5}],smudgeOnStroke:true,smudgeDensity:70,grainSmoothing:false,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',
+  note:'Rounded dab marks \u2014 the wide Spacing (35) is what makes this a dabbing brush rather than a continuous stroke; each press leaves a discrete oval mark'},
+ {name:'Recon Dabber Fan',group:'Dabber',shape:'fan',sizePx:50,maxSizePx:280,opacity:0.5,flow:0.55,water:0,loading:75,oiliness:40,grain:0.55,pigment:0.3,spacing:25,
+  sizeJitter:10,opacityJitter:8,scatter:8,rotationMode:'trajectory',
+  grainGen:['Coarse Sponge',{density:6,detail:6,contrast:6}],smudgeOnStroke:true,smudgeDensity:70,grainSmoothing:false,
+  sizeBehavior:'pressure-soft',opacityBehavior:'pressure-soft',
+  note:'Fan bristle bundle dabbed rather than dragged \u2014 11 spread bristles at wide spacing for foliage/texture stamping'},
 ];
 /* =========================================================================
    INK RECONSTRUCTION — 40 brushes, from the user's Rebelle Ink library
@@ -3040,7 +3410,18 @@ function footprint(shape,size,angle,speed,brushObj){
   const angleJitterRad = brushObj && brushObj.angleJitterDeg ? (Math.random()-0.5)*2*(brushObj.angleJitterDeg*Math.PI/180) : 0;
   let rx=size*.5, ry=size*.5, rot=baseAngle+tilt+angleJitterRad+randomKick+(liveTiltWiden>0?livePenTilt.angleRad*tiltSensitivity*0.3:0);
   switch(shape){
-    case 'round': ry=size*(.5-.20*speed)*(1-form*.35)*(1-liveTiltWiden*0.6); break;
+    // The `-.20*speed` term elongates a round mark along the stroke as it is dragged faster,
+    // which is right for a physical brush tip flexing under load — but WRONG for an airbrush,
+    // whose spray cone is radially symmetric and does not deform with hand speed at all. Left
+    // unexempted it squashed every airbrush dab by up to 40% vertically, turning what should be
+    // round sprayed clouds into ovals that lean with stroke direction (clearly visible when
+    // comparing against the round marks on the sample sheet). Airbrush therefore keeps a
+    // circular footprint regardless of speed; every other tool keeps the original behaviour.
+    case 'round': {
+      const speedSquash = (brushObj && brushObj.engine==='airbrush') ? 0 : .20*speed;
+      ry=size*(.5-speedSquash)*(1-form*.35)*(1-liveTiltWiden*0.6);
+      break;
+    }
     case 'mop': case 'wash': rx=size*.62; ry=size*.42; break;
     case 'flat': rx=size*.66; ry=size*.16*(1+form*.6); break;
     case 'filbert': rx=size*.52; ry=size*.30; break;
@@ -3048,21 +3429,52 @@ function footprint(shape,size,angle,speed,brushObj){
     case 'liner': rx=size*.5; ry=size*.09; break;
     case 'knife': rx=size*.62; ry=size*.20; break;
     case 'grunge': rx=size*.5; ry=size*.4; break;
+    // 'rake': a comb/rake brush — a wide, shallow footprint whose real character comes from
+    // makeBristles() spacing several DISCRETE, well-separated bristles across its width, so
+    // the oil engine draws multiple parallel paint lines with visible clean gaps between them
+    // (a real rake/comb mark) instead of one continuous filled band. Deliberately shallower
+    // in ry than 'flat' so the parallel lines stay distinct rather than merging together.
+    case 'rake': rx=size*.60; ry=size*.13; break;
     case 'splat': rx=size*.16; ry=size*.13; break;
     case 'drip': rx=size*.14; ry=size*.5; rot=Math.PI/2; break;
     default: rx=size*.5; ry=size*.5;
   }
   return {rx:Math.max(1,rx),ry:Math.max(1,ry),rot};
 }
+// Bristle layout per brush shape, for the oil/acrylic engine.
+// IMPORTANT: depositOil() does NOT call footprint() at all — it lays down one small elliptical
+// dab per BRISTLE instead, so for oil/acrylic brushes the `shape` field only reaches the
+// renderer through this function (plus the knife ry-squash and knife impasto boost). That had
+// a real consequence: every shape without an explicit branch here fell through to the same
+// generic 7-bristle circular cluster, so Oil Round, Filbert, Liner and Splat brushes were
+// pixel-for-pixel IDENTICAL in layout no matter what shape they declared — a direct cause of
+// oil brushes all looking alike regardless of their nominal shape. The liner/filbert/splat
+// branches below exist to make those shapes genuinely distinct in this engine, matching the
+// proportions footprint() gives them in the wet-media engine (liner = narrow, filbert = oval,
+// splat = scattered dots) rather than silently collapsing them all into a circle.
 function makeBristles(brushObj){
   const shape=brushObj.shape;
-  const n = shape==='knife'?1 : shape==='fan'?11 : shape==='grunge'?14 : shape==='flat'?6 : 7;
+  const n = shape==='knife'?1 : shape==='fan'?11 : shape==='grunge'?14 : shape==='flat'?6
+          : shape==='rake'?6 : shape==='liner'?4 : shape==='splat'?10 : 7;
   const arr=[];
   for(let i=0;i<n;i++){
     let ox,oy,r;
-    if(shape==='flat'||shape==='knife'){ ox=(i/(Math.max(1,n-1))-0.5)*40; oy=(Math.random()-0.5)*4; r=0.85+Math.random()*0.3; }
+    // 'rake': evenly spaced across a WIDER span (56 vs flat's 40) with a deliberately SMALL
+    // per-bristle radius (0.3-0.42 vs flat's 0.85-1.15) and almost no vertical wander, so the
+    // bristles stay separated into distinct parallel lines with real gaps between them —
+    // that separation is the whole point of a rake/comb brush, and a flat brush's large
+    // overlapping bristles would just merge into one solid band instead.
+    if(shape==='rake'){ ox=(i/Math.max(1,n-1)-0.5)*56; oy=(Math.random()-0.5)*1.5; r=0.30+Math.random()*0.12; }
+    else if(shape==='flat'||shape==='knife'){ ox=(i/(Math.max(1,n-1))-0.5)*40; oy=(Math.random()-0.5)*4; r=0.85+Math.random()*0.3; }
     else if(shape==='fan'){ ox=(i/(n-1)-0.5)*46; oy=-6+Math.random()*3; r=0.5+Math.random()*0.25; }
     else if(shape==='grunge'){ ox=(Math.random()-0.5)*44; oy=(Math.random()-0.5)*44; r=0.35+Math.random()*0.4; }
+    // 'liner': few bristles in a tight, narrow row — a fine detail/rigger line, not a circle.
+    else if(shape==='liner'){ ox=(i/Math.max(1,n-1)-0.5)*14; oy=(Math.random()-0.5)*2.5; r=0.34+Math.random()*0.14; }
+    // 'filbert': elliptical cluster (wider than tall) so it reads as the rounded-oval tip it
+    // is in the wet engine, instead of the perfectly round cluster it used to collapse into.
+    else if(shape==='filbert'){ const a=(i/n)*Math.PI*2; ox=Math.cos(a)*15*(0.55+Math.random()*0.45); oy=Math.sin(a)*8*(0.55+Math.random()*0.45); r=0.6+Math.random()*0.3; }
+    // 'splat': many small bristles thrown across a wide area — scattered spatter dots.
+    else if(shape==='splat'){ ox=(Math.random()-0.5)*30; oy=(Math.random()-0.5)*30; r=0.16+Math.random()*0.2; }
     else { const a=(i/n)*Math.PI*2; ox=Math.cos(a)*10*Math.random(); oy=Math.sin(a)*10*Math.random(); r=0.55+Math.random()*0.35; }
     arr.push({ox,oy,r,wear:Math.random()*0.4,jitterSeed:Math.random()});
   }
@@ -3340,10 +3752,27 @@ function depositWet(L,x,y,pressure,angle,speed,b,bias){
   // Used by cleaner Marker brushes (grain should stay controlled, not turn into charcoal)
   // vs. rougher Dry/Pastel brushes which explicitly want Smoothing OFF for maximum texture.
   const grainScale = Math.max(4,size*0.5) * (b.grainSmoothing ? 1.7 : 1);
+  // Edge Softness (Brush Creator > Shape, used by the Airbrush family): a real, tunable
+  // per-brush falloff exponent instead of the single fixed pow(1-rr,1.4) every brush used
+  // before this field existed. Higher edgeSoftness (toward 100) lowers the exponent toward
+  // 0.5, which keeps `fall` high across MORE of the dab's radius before dropping — a broad,
+  // photographic, "cloud"-like spray. Lower edgeSoftness (toward 0) raises the exponent
+  // toward 2.6, which keeps `fall` concentrated near the center and drops off faster —  a
+  // tight, punchy spot. This is an exponent-based APPROXIMATION of a named 5-point falloff
+  // table (center/25%/50%/75%/edge percentages) like the ones in the Airbrush reconstruction
+  // spec, not a literal piecewise curve through those exact breakpoints — same honest
+  // "reconstruction, not exact values" framing as every brush spec table in this file.
+  // The neutral default is 57, which maps back to an exponent of 1.403 — i.e. essentially
+  // EXACTLY the 1.4 that was hardcoded here before this field existed (a 0.2% difference,
+  // visually identical). That means every pre-existing brush keeps rendering exactly as it
+  // did while still exposing a working Edge Softness slider, rather than needing a null
+  // special-case branch. The `!=null` fallback below only matters for brush objects that
+  // somehow bypass setBrush()'s defaulting.
+  const falloffExp = b.edgeSoftness!=null ? lerp(2.6,0.5,clamp(b.edgeSoftness,0,100)/100) : 1.4;
   forEachInDab(x,y,fp.rx,fp.ry,fp.rot,stride,(px,py,i,rr,nx,ny)=>{
     if(!inSelection(px,py)) return;
     const st=stencilAlpha(px,py); if(st<=0.02) return;
-    const fall=b.shapeTex ? sampleTexShape(b.shapeTex,nx,ny) : Math.pow(1-rr,1.4);
+    const fall=b.shapeTex ? sampleTexShape(b.shapeTex,nx,ny) : Math.pow(1-rr,falloffExp);
     if(fall<=0.006) return;
     let tooth=b.grainTex ? lerp(toothMap[i],sampleTexTiled(b.grainTex,px,py,grainScale),0.7) : toothMap[i];
     if(b.grainSmoothing) tooth=lerp(tooth,0.5,0.35);
@@ -3464,7 +3893,11 @@ function depositOil(L,x,y,pressure,angle,speed,b){
   if(!L||L.locked) return;
   if(!strokeState.bristles) strokeState.bristles=makeBristles(b);
   const sizeK=evalCurve(b.sizeBehavior||'pressure',pressure,speed,b.sizeCurve);
-  const size=clamp(b.size*(0.35+0.85*sizeK),2,b.maxSize||b.size*4);
+  // Size Jitter: same real per-dab random size multiplier depositWet() has, now also honored
+  // by the oil engine (previously silently ignored for every Oil/Acrylic/Express Oil brush,
+  // even though buildBrushesFromReconSpecs already set brush.sizeJitter for every tool).
+  const sizeJitterMul = b.sizeJitter ? 1+(Math.random()-0.5)*2*clamp(b.sizeJitter/100,0,1) : 1;
+  const size=clamp(b.size*(0.35+0.85*sizeK)*sizeJitterMul,2,b.maxSize||b.size*4);
   const lengthNorm=(b.length!=null?b.length:100)/100;
   const loadFactor=lengthNorm>=0.99?1:clamp(1-strokeState.dist/(size*(6+lengthNorm*120)+1),0.04,1);
   const baseCol=currentColorRGB();
@@ -3473,6 +3906,22 @@ function depositOil(L,x,y,pressure,angle,speed,b){
   const stampCol=jitterActive && b.jitter.mode==='stamp' ? getJitteredColor(b) : strokeCol;
   const oili=clamp(b.oiliness/100,0,1);
   const mode=b.paintMode||'paintmix';
+  // Loading Jitter: Oil & Acrylic's real Brush Creator field name for what depositWet calls
+  // Opacity Jitter — same real per-dab random multiplier mechanism, reusing b.opacityJitter
+  // as the value since this engine has no separate "opacity" volume of its own (Loading IS
+  // its primary paint-volume control, matching the source spec's own "Loading Jitter" name).
+  const loadingJitterMul = b.opacityJitter ? clamp(1+(Math.random()-0.5)*2*clamp(b.opacityJitter/100,0,1),0.05,2) : 1;
+  // BUG FIX: Pressure -> Loading had NO effect whatsoever on oil/acrylic brushes. This engine
+  // evaluated the size curve (sizeK, above) but never evaluated the opacity/loading curve at
+  // all, so amountBase was built purely from static brush fields — meaning pressing harder
+  // with ANY Oil & Acrylic or Express Oil brush changed the stroke's WIDTH but never how much
+  // paint it actually laid down. That is a large part of why every oil brush read as flat and
+  // pressure-insensitive regardless of its settings. depositWet() has always applied its
+  // equivalent curve (opacK); this brings the oil engine in line with it. Oil & Acrylic's real
+  // Brush Creator calls this control "Pressure -> Loading" rather than "Pressure -> Opacity",
+  // since Loading (not opacity) is this medium's paint-volume property — same curve field,
+  // medium-appropriate name.
+  const loadK=evalCurve(b.opacityBehavior||'pressure-soft',pressure,speed,b.opacityCurve);
   const cos=Math.cos(angle), sin=Math.sin(angle);
   strokeState.bristles.forEach(br=>{
     // Per-bristle jitter: each bristle gets its own stable-seeded color offset so the same
@@ -3484,7 +3933,7 @@ function depositOil(L,x,y,pressure,angle,speed,b){
     const bx=x+(br.ox*cos-br.oy*sin)*size/60;
     const by=y+(br.ox*sin+br.oy*cos)*size/60;
     const r=Math.max(1.2,size*br.r*0.5);
-    const amountBase=(b.loading!=null?b.loading/100:1)*b.opacity*b.flow*loadFactor*(1-br.wear*0.35);
+    const amountBase=(b.loading!=null?b.loading/100:1)*b.opacity*b.flow*loadK*loadFactor*loadingJitterMul*(1-br.wear*0.35);
     forEachInDab(bx,by,r,r*(b.shape==='knife'?0.55:1),angle,1,(px,py,i,rr)=>{
       if(!inSelection(px,py)) return;
       const st=stencilAlpha(px,py); if(st<=0.02) return;
@@ -3495,16 +3944,46 @@ function depositOil(L,x,y,pressure,angle,speed,b){
       // contributing to every oil-engine brush looking like a flat, textureless blob
       // regardless of its grain setting. Same fix as depositWet(): blend in the brush's own
       // grain texture (tiled to world space) when it has one, exactly like the wet-media path.
-      const tooth=b.grainTex ? lerp(toothMap[i],sampleTexTiled(b.grainTex,px,py,Math.max(4,size*0.5)),0.7) : toothMap[i];
+      // Grain Smoothing: same real mechanism depositWet() has (a larger sample tile scale +
+      // pulling the tooth value toward its own mean), now also honored here — previously
+      // silently ignored for the oil engine even though it's a real, meaningful field.
+      const grainScale2 = Math.max(4,size*0.5) * (b.grainSmoothing ? 1.7 : 1);
+      let tooth=b.grainTex ? lerp(toothMap[i],sampleTexTiled(b.grainTex,px,py,grainScale2),0.7) : toothMap[i];
+      if(b.grainSmoothing) tooth=lerp(tooth,0.5,0.35);
       const grainAmt2=b.grain*(0.4+V.textureInfluence/10);
-      let amount=amountBase*fall*(0.7+0.3*tooth)*st;
+      // Oiliness now drives COVERAGE, not just colour mixing. Physically, dry paint only
+      // catches on the paper's raised tooth and skips the valleys, while wet/oily paint floods
+      // the valleys and covers evenly. Before this, tooth influence was pinned at a fixed
+      // `0.7+0.3*tooth` for EVERY oil brush — only 30% weight, identical for a bone-dry brush
+      // and a soaking-oily one — so Oiliness only ever changed how colours blended and had no
+      // effect whatsoever on whether a stroke looked dry or wet. Measured consequence: all 15
+      // Round/Bristle/Flat/Filbert brushes rendered as the same solid black band regardless of
+      // their Oiliness (5 vs 90), which is precisely the "every oil brush looks identical"
+      // problem. Now a bone-dry brush (oiliness 5) weights tooth at ~0.87, so paper valleys
+      // receive only ~13% of the paint and genuinely break the stroke up, while an oily brush
+      // (oiliness 90) weights it at ~0.36 and lays down near-uniform coverage. This makes the
+      // Dry <-> Oily axis — the primary axis of the source's own control matrix — actually
+      // visible, which is the whole point of Oiliness existing as a separate control.
+      const toothInfluence = 0.3+0.6*(1-oili);
+      let amount=amountBase*fall*((1-toothInfluence)+toothInfluence*tooth)*st;
       if(amount<=0.0006) return;
       if(L.lockAlpha && L.pd[i]<=0.002) return;
       // Same "grain sets a ceiling, not just a speed" fix as depositWet(): without this, the
       // oil engine's per-dab additive buildup (L.pd[i]+amount*0.5) still eventually washes
       // every pixel to the same coverage regardless of tooth once a stroke is passed over
       // enough times, which is what erased grain texture in oils just as it did in wet media.
-      const grainCeilingMul2 = grainAmt2>0.02 ? lerp(1-grainAmt2*0.55, 1, tooth) : 1;
+      // The grain ceiling has to bite considerably harder in the oil engine than the 0.55
+      // factor used before. Oil strokes accumulate paint fast (many heavily overlapping
+      // bristle dabs per stroke), and the pd ceiling here is 2.6 — so at 0.55 even a
+      // grain:0.8 "Rough Dry" brush still had a low-tooth ceiling of ~1.56, far above the
+      // point where a pixel already renders fully opaque. Measured result: every Round /
+      // Flat / Bristle / Filbert brush filled in at 99-100% coverage with average pd 1.7-2.4
+      // regardless of its grain value, i.e. dry brushes were indistinguishable from oily ones
+      // and grain had no visible effect at all. At 0.95 the low-tooth ceiling for a high-grain
+      // brush lands near or below 1.0, so the paper's untouched valleys genuinely show through
+      // as dry-brush breakup, while low-grain brushes (Round Hard at grain 0.2 -> ceiling
+      // ~2.16) still lay down the solid opaque paint they are supposed to.
+      const grainCeilingMul2 = grainAmt2>0.02 ? lerp(1-grainAmt2*0.95, 1, tooth) : 1;
       const mixT = mode==='paint' ? Math.min(0.94,fall*0.92) : clamp(0.22+0.65*oili,0,0.95)*fall;
       const hadColor=L.pd[i]>0.01;
       const oR=hadColor?L.pr[i]:col.r, oG=hadColor?L.pg[i]:col.g, oB=hadColor?L.pb[i]:col.b;
@@ -4196,7 +4675,7 @@ function symmetryCopies(p,angle){
 // near-circle doesn't change its footprint. The fix: smooth the angle across a stroke,
 // trusting long/confident segments fully but barely moving the angle for tiny/jittery ones.
 function angleDeltaMod(a,b,mod){ let d=(a-b)%mod; if(d>mod/2) d-=mod; if(d<-mod/2) d+=mod; return d; }
-const ELONGATED_SHAPES=['liner','flat','knife','fan'];
+const ELONGATED_SHAPES=['liner','flat','knife','fan','rake'];
 function paint(a,b_){
   const L=activeLayer(); if(!L) return;
   const d=Math.max(0.6,dist(a,b_));
@@ -4825,6 +5304,9 @@ function setBrush(key,keepTool){
   if(brush.grainSmoothing==null) brush.grainSmoothing=false;
   if(brush.randomStart==null) brush.randomStart=false;
   if(brush.randomStamp==null) brush.randomStamp=false;
+  // 57 == the old hardcoded pow(1-rr,1.4) falloff, so defaulting it here changes nothing
+  // visually for existing brushes while making the Edge Softness slider functional for all.
+  if(brush.edgeSoftness==null) brush.edgeSoftness=57;
   const modeOpts=PAINT_MODES_BY_ENGINE[brush.engine]||['paint','paintmix','paintblend','blend','erase'];
   if(brush.paintMode==null || !modeOpts.includes(brush.paintMode)) brush.paintMode=modeOpts.includes('paintmix')?'paintmix':'paint';
   brush.key=key;
@@ -5077,7 +5559,7 @@ function buildBrushCreator(){
     html+=grpOpen('Spacing')+srow('Spacing','brush.spacing',1.5,60,0.5)+srow('Spacing Jitter','brush.spacingJitter',0,100,1)+srow('Scatter','brush.scatter',0,100,1)+srowChk('Smudge','brush.smudgeOnStroke')+(brush.smudgeOnStroke?srow('Smudge Density','brush.smudgeDensity',0,100,1):'')+grpClose();
     html+=grpOpen('Rotation')+srowSel('Rotation Mode','brush.rotationMode',[['trajectory','Follow Trajectory'],['fixed','Fixed (Shape Angle)'],['none','None']])+srow('Shape Angle','brush.shapeAngle',0,180,1)+srow('Angle Jitter','brush.angleJitterDeg',0,45,1)+srowChk('Random Start','brush.randomStart')+srowChk('Random Stamp','brush.randomStamp')+grpClose();
   } else if(bcTab==='shape'){
-    html+=grpOpen('Shape & Grain')+srow('Grain','brush.grain',0,1,0.01)+srow('Pigment Density','brush.pigment',0.02,1,0.01)+srowChk('Grain Smoothing','brush.grainSmoothing')+grpClose();
+    html+=grpOpen('Shape & Grain')+srow('Grain','brush.grain',0,1,0.01)+srow('Pigment Density','brush.pigment',0.02,1,0.01)+srowChk('Grain Smoothing','brush.grainSmoothing')+srow('Edge Softness','brush.edgeSoftness',0,100,1)+grpClose();
     html+=grpOpen('Brush Shape');
     html+=`<div class="texRow">
       <div class="texPreview">${brush.shapeTexURL?`<img src="${brush.shapeTexURL}">`:'<span class="tinyNote">procedural</span>'}</div>
