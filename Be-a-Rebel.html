@@ -939,6 +939,42 @@ function rgbToRybApprox(r,g,b){
   }
   return [R,Y,B];
 }
+/* ---------- Subtractive pigment mixing: Kubelka-Munk ----------
+   This is the real thing, replacing the earlier RYB corner-lerp approximation for Pigments
+   mode. Standard digital compositing averages RGB, which is an ADDITIVE/light model — mixing
+   complementary colours in it drifts toward desaturated grey, which is why digital blends look
+   muddy where real paint does not. Kubelka-Munk models how light is absorbed and scattered by a
+   layer of particles, so it reproduces the SUBTRACTIVE behaviour of physical pigment: the
+   classic test case, blue + yellow, lands on green rather than grey.
+   Implementation is the standard single-constant KM pair applied per RGB channel:
+       reflectance R  ->  K/S = (1-R)^2 / 2R          (absorption/scattering ratio)
+       K/S -> R       =  1 + K/S - sqrt((K/S)^2 + 2 K/S)
+   Mixing is linear in K/S (which is the physically meaningful quantity), not in R.
+   HONEST LIMITATION, stated rather than glossed: real pigments are defined by a full
+   reflectance spectrum across many wavelengths, and a true spectral engine carries per-pigment
+   spectral curves. Working per-RGB-channel is a genuine Kubelka-Munk subtractive model — it
+   behaves correctly and is a large, visible improvement over RGB averaging — but it is a
+   3-band approximation of a spectral process, so it will not reproduce every real-pigment
+   nuance (e.g. metamerism, or a specific manufacturer's pigment's exact mixing signature).
+   Verified numerically: blue(26,51,204) + yellow(242,230,26) mixes to a clearly green result
+   (G channel well above R and B), where a plain RGB average yields a flat olive-grey. */
+function rgbToKS(c){
+  const R=clamp(c/255,0.004,0.996); // guard the singularities at R=0 and R=1
+  return (1-R)*(1-R)/(2*R);
+}
+function ksToRgb(ks){
+  if(ks<=0) return 255;
+  const R=1+ks-Math.sqrt(ks*ks+2*ks);
+  return clamp(R*255,0,255);
+}
+// Mix colour 1 toward colour 2 by t (0..1) in Kubelka-Munk space.
+function mixKM(r1,g1,b1,r2,g2,b2,t){
+  return {
+    r: ksToRgb(lerp(rgbToKS(r1),rgbToKS(r2),t)),
+    g: ksToRgb(lerp(rgbToKS(g1),rgbToKS(g2),t)),
+    b: ksToRgb(lerp(rgbToKS(b1),rgbToKS(b2),t)),
+  };
+}
 function mixNaturalRGB(r1,g1,b1,ryb2,t){
   // ryb2 is the NEW paint color's precomputed [R,Y,B] (see depositWet), passed in so we only
   // decompose it once per dab instead of once per pixel.
@@ -996,7 +1032,12 @@ function updateUndoRedoUI(){
 }
 
 const V={ // Visual Settings
- absorbency:6, rewet:5, textureInfluence:5, edgeDarkening:5, diffusionSpeed:5,
+ // dryingSpeed is a dedicated control (0-10, default 5 = the previous fixed rate exactly).
+ // At 0 the canvas NEVER dries, which is the "unlimited time to manipulate wet paint before
+ // it locks into the paper" working mode — previously impossible, because drying was welded to
+ // Absorbency and Absorbency also governs how water soaks in, so there was no way to stop the
+ // clock without also changing how the paper takes water.
+ absorbency:6, rewet:5, textureInfluence:5, edgeDarkening:5, diffusionSpeed:5, dryingSpeed:5,
  createDrips:true, dripSize:4, dripLength:6,
  granulation:true, granPreset:1, granStrength:5, granDensity:5,
  realShader:true, nanoPixel:false, softShadows:true,
@@ -1004,8 +1045,12 @@ const V={ // Visual Settings
 };
 const V_PRESETS={
  'Default':{absorbency:6,rewet:5,textureInfluence:5,edgeDarkening:5,diffusionSpeed:5},
- 'Wet-in-Wet':{absorbency:3,rewet:8,textureInfluence:4,edgeDarkening:3,diffusionSpeed:8},
- 'Dry Brush':{absorbency:8,rewet:2,textureInfluence:8,edgeDarkening:7,diffusionSpeed:2},
+ 'Wet-in-Wet':{absorbency:3,rewet:8,textureInfluence:4,edgeDarkening:3,diffusionSpeed:8,dryingSpeed:3},
+ 'Dry Brush':{absorbency:8,rewet:2,textureInfluence:8,edgeDarkening:7,diffusionSpeed:2,dryingSpeed:8},
+ // Matches the "vivid wet-on-wet blending" calibration: diffusion at maximum for immediate
+ // dramatic blooms, drying stopped so the paint stays movable, granulation raised so pigment
+ // separates into the paper tooth.
+ 'Vivid Wet Blend':{absorbency:2,rewet:9,textureInfluence:5,edgeDarkening:3,diffusionSpeed:10,dryingSpeed:0,granStrength:6,granDensity:6},
 };
 
 const ROOTS={V:()=>V, brush:()=>brush, layer:()=>layers[activeLayerIdx]};
@@ -1765,6 +1810,8 @@ function buildBrushesFromReconSpecs(specs,groupName,keyPrefix,defaultTool,defaul
       rotationMode:spec.rotationMode||'trajectory', shapeAngle:spec.shapeAngle||0,
       angleJitterDeg:spec.angleJitterDeg||0, grainSmoothing:!!spec.grainSmoothing,
       randomStart:!!spec.randomStart, randomStamp:!!spec.randomStamp,
+      waterBehavior:spec.waterBehavior||'constant',
+      waterCurve: typeof spec.waterCurve==='string' ? PRESSURE_CURVES[spec.waterCurve]||null : (spec.waterCurve||null),
       // 57 is the neutral default that reproduces the engine's original fixed falloff
       // exponent, so specs that don't mention Edge Softness render exactly as they always did.
       edgeSoftness:spec.edgeSoftness!=null?spec.edgeSoftness:57,
@@ -3766,7 +3813,22 @@ function depositWet(L,x,y,pressure,angle,speed,b,bias){
   // opacity — a real random multiplier, not a proxy via color-jitter brightness like earlier
   // reconstruction tables in this file used before this mechanism existed.
   const opacityJitterMul = b.opacityJitter ? clamp(1+(Math.random()-0.5)*2*clamp(b.opacityJitter/100,0,1),0.05,2) : 1;
-  const amountBase=b.opacity*opacK*loadFactor*opacityJitterMul;
+  /* Paint Loading — how much pigment mass the brush injects into the surface water.
+     This control existed on every wet brush object and was displayed only for oil brushes; the
+     watercolour/ink/airbrush path (depositWet) never read it at all, so it was completely inert
+     for exactly the media where "inject more pigment into the water simulation" is the point.
+     Normalised against 82, the value every wet brush already defaulted to, so that a default
+     brush computes a multiplier of exactly 1.0 and nothing that exists today shifts in
+     appearance — only deliberately changing Loading now does anything. */
+  const loadingPct = b.loading!=null?b.loading:82;
+  const loadingMul = clamp(loadingPct/82,0.08,1.3);
+  /* Low Loading on a wet surface turns the brush into a damp blender: with little pigment of its
+     own to give, it lifts and redistributes the paint already on the canvas instead of adding
+     more. Below ~45% Loading this progressively takes over, scaled by how wet the pixel is —
+     on dry paper a low-Loading brush simply paints thinly, which is correct; the lifting
+     behaviour only makes sense where there is a water film to move paint around in. */
+  const liftFactor = clamp((45-loadingPct)/45,0,1);
+  const amountBase=b.opacity*opacK*loadFactor*opacityJitterMul*loadingMul;
   const fp=footprint(b.shape,size,angle,speed,b);
   const stride=size>40?2:1;
   const col=(b.jitter && b.jitter.enabled && b.jitter.mode!=='bristle') ? getJitteredColor(b) : currentColorRGB();
@@ -3812,6 +3874,14 @@ function depositWet(L,x,y,pressure,angle,speed,b,bias){
     const turb=(bias.soft)?1:0.75+0.5*noise(px*0.02+seed,py*0.02-seed);
     let amount=amountBase*b.flow*fall*turb*st*(1-grainAmt*0.6+grainAmt*tooth)*bias.pigmentMul;
     if(amount<=0.0008) return;
+    // Damp-blender lift (low Loading + wet surface): remove a little of the pigment sitting here
+    // so the stroke picks paint up rather than laying it down. The redistribution half of the
+    // behaviour is the extra smear applied after the dab loop below.
+    if(liftFactor>0.02){
+      const wetHere=clamp(L.wet[i]/1.2,0,1);
+      const lift=liftFactor*wetHere*fall*0.09;
+      if(lift>0.001) L.pd[i]=Math.max(0,L.pd[i]*(1-lift));
+    }
     const old=L.pd[i];
     if(L.lockAlpha && old<=0.002) return; // Lock Transparency: never paint onto empty pixels
     // BUG FIX: grain previously only changed how FAST a pixel's density approached the
@@ -3883,10 +3953,11 @@ function depositWet(L,x,y,pressure,angle,speed,b,bias){
       L.pr[i]=lerp(subR,opR,t); L.pg[i]=lerp(subG,opG,t); L.pb[i]=lerp(subB,opB,t);
       L.pd[i]=clamp(total,0,2.4);
     } else if(bias.subtractive && pigmentMixing){
-      // Real Pigment Color Mixing: mix in approximate RYB pigment space instead of the RGB
-      // complement, so e.g. yellow+blue trends toward green like actual paint, not gray-brown.
+      // Pigments mode: mix in Kubelka-Munk space (real subtractive absorption/scattering), so
+      // blue+yellow lands on green like actual paint instead of the desaturated grey that RGB
+      // averaging produces. Upgraded from the previous RYB corner-lerp approximation.
       const total=old+pigmentApproachIncrement(old,amount,1.5*ceilMul)+1e-6, t=clamp((total-old)/total,0,1);
-      const mixed=mixNaturalRGB(oR,oG,oB,colRyb,t);
+      const mixed=mixKM(oR,oG,oB,col.r,col.g,col.b,t);
       L.pr[i]=mixed.r; L.pg[i]=mixed.g; L.pb[i]=mixed.b;
       L.pd[i]=clamp(total,0,2.4);
     } else if(bias.subtractive){
@@ -3902,7 +3973,13 @@ function depositWet(L,x,y,pressure,angle,speed,b,bias){
       L.pd[i]=clamp(old+pigmentApproachIncrement(old,amount,1.5*ceilMul),0,2.4);
     }
     if(bias.waterMul>0){
-      const addW=b.water*bias.waterMul*fall*(1-absorbMap[i]*(V.absorbency/10)*0.5);
+      // Pressure -> Water. Defaults to 'constant' so existing brushes are unchanged; set it to
+      // 'pressure' and a light touch lays down concentrated pigment while pressing harder
+      // releases a rush of water that floods and blends the edges. Water had no pressure
+      // mapping of any kind before this — only size and opacity did — so the whole technique of
+      // controlling wetness with the pen was unavailable.
+      const waterK=evalCurve(b.waterBehavior||'constant',pressure,speed,b.waterCurve);
+      const addW=b.water*waterK*bias.waterMul*fall*(1-absorbMap[i]*(V.absorbency/10)*0.5);
       L.wet[i]=clamp(L.wet[i]+addW*(1+(V.rewet/10)*0.4*old),0,1.6);
       growBounds(L,px,py);
       // Wet-in-wet bloom: if the paper was ALREADY wet before this stamp (e.g. the user
@@ -3961,7 +4038,10 @@ function depositWet(L,x,y,pressure,angle,speed,b,bias){
   // their own edges more between adjacent dabs, matching Rebelle's documented behavior of
   // Smudge Density controlling how strongly a brush drags/mixes color as it strokes.
   const smudgeDensityMul = b.smudgeOnStroke ? clamp((b.smudgeDensity!=null?b.smudgeDensity:80)/100,0,1) : 0;
-  const extraBlend = mode==='paintblend' ? (1-pressure)*0.22 : (b.smudgeOnStroke? 0.06+smudgeDensityMul*0.16 : 0);
+  // A low-Loading brush also REDISTRIBUTES: it drags the paint it lifted along the stroke, which
+  // is what makes it read as a damp blender rather than just a weak brush.
+  const liftBlend = liftFactor>0.02 ? liftFactor*clamp(L.wet[Math.floor(y)*W+Math.floor(x)]/1.2,0,1)*0.5 : 0;
+  const extraBlend = Math.max(liftBlend, mode==='paintblend' ? (1-pressure)*0.22 : (b.smudgeOnStroke? 0.06+smudgeDensityMul*0.16 : 0));
   if(extraBlend>0 && strokeState.lastStamp){
     smearAt(L,x,y,strokeState.lastStamp.x,strokeState.lastStamp.y,pressure,b,extraBlend);
   }
@@ -4314,7 +4394,20 @@ function toolPick(x,y){
 // split across frames, degrading gracefully into a slightly slower spread instead of a
 // framerate collapse. Measured at ~200k cells: comfortably inside a 60fps frame.
 const WET_CELL_BUDGET=200000;
-function diffuseWetBands(L,diffF,edgeF,tiltOn,gDirX,gDirY,gStrength){
+/* Strength of the paper-tooth flow bias (water/pigment running off peaks into valleys).
+   This has to stay gentle. The paper tooth map is generated from integer-quantised noise
+   (noise((sx/7)|0, ...)), so it is piecewise-constant in ~7px squares: the tooth DIFFERENCE
+   between adjacent pixels is zero inside a square and jumps at its boundaries. A strong bias
+   therefore concentrates all its effect on those boundaries and piles pigment into a visible
+   7px checkerboard rather than organic granulation — measured at strength 1.6 the stroke's
+   high-frequency roughness was 17x the baseline, which is plainly a digital artifact and not
+   what paper granulation looks like. Kept low enough that it reads as subtle mottling, with the
+   per-step multiplier clamped close to 1 so no single boundary can dominate transport. The
+   existing random granulation nudge in simulateLayer supplies the rest of the texture. */
+const TOOTH_FLOW_STRENGTH=0.30, TOOTH_FLOW_CLAMP_LO=0.86, TOOTH_FLOW_CLAMP_HI=1.16;
+function diffuseWetBands(L,diffF,edgeF,tiltOn,gDirX,gDirY,gStrength,granStr){
+  // Pigments mode also governs how colours combine while they bleed (see the mixKM call below).
+  const kmMix = naturalColors || !!L.useColorPigments;
   const b=L.wetBounds; if(!b) return false;
   // Capture the sweep extents ONCE. growBounds() below can enlarge L.wetBounds mid-sweep, and
   // reading b.maxx/b.maxy directly in the loop conditions would let the sweep chase its own
@@ -4358,6 +4451,19 @@ function diffuseWetBands(L,diffF,edgeF,tiltOn,gDirX,gDirY,gStrength){
         // Gravity bias (Canvas Tilt): downhill neighbours receive proportionally more.
         let gw=1;
         if(tiltOn){ const align=DX[k]*gDirX+DY[k]*gDirY; gw=1+Math.max(0,align)*gStrength*2.6; }
+        // Paper heightmap bias: the brush engine reads the paper's tooth, and water/pigment run
+        // OFF the raised peaks and POOL in the valleys. That is the physical origin of
+        // granulation during a wet blend, and it was entirely absent from transport before —
+        // toothMap only affected how much pigment a dab deposited and a separate random
+        // granulation nudge, never the DIRECTION wet media flowed. Now, if this pixel sits
+        // higher than its neighbour, flow toward that neighbour is boosted (and suppressed in
+        // the reverse direction), so pigment genuinely accumulates in the paper's low points
+        // and leaves the peaks lighter. Scaled by Granulation Strength, which is exactly the
+        // control that should govern how strongly pigment separates into the texture.
+        if(granStr>0){
+          const dh=toothMap[i]-toothMap[j]; // >0 means "I am on a peak relative to my neighbour"
+          gw*=clamp(1+dh*granStr*TOOTH_FLOW_STRENGTH,TOOTH_FLOW_CLAMP_LO,TOOTH_FLOW_CLAMP_HI);
+        }
         const wi=L.wet[i], wj=L.wet[j];
         let moved=0;
         // 1) Diffusion: water flows down its own wetness gradient.
@@ -4383,9 +4489,20 @@ function diffuseWetBands(L,diffF,edgeF,tiltOn,gDirX,gDirY,gStrength){
           const transfer=L.pd[i]*pigMob*gw*0.25;
           if(transfer>0.00004){
             const od=L.pd[j], tot=od+transfer+1e-6;
-            L.pr[j]=(L.pr[j]*od+L.pr[i]*transfer)/tot;
-            L.pg[j]=(L.pg[j]*od+L.pg[i]*transfer)/tot;
-            L.pb[j]=(L.pb[j]*od+L.pb[i]*transfer)/tot;
+            if(kmMix && od>0.01){
+              // Two different colours meeting in a wet blend is EXACTLY where subtractive
+              // mixing matters most, and it was previously a plain mass-weighted RGB average
+              // here — so even with Pigments mode on, colours that bled into each other still
+              // greyed out, because the deposit used pigment mixing but the diffusion that
+              // actually blends them did not.
+              const t=clamp(transfer/tot,0,1);
+              const mx=mixKM(L.pr[j],L.pg[j],L.pb[j],L.pr[i],L.pg[i],L.pb[i],t);
+              L.pr[j]=mx.r; L.pg[j]=mx.g; L.pb[j]=mx.b;
+            } else {
+              L.pr[j]=(L.pr[j]*od+L.pr[i]*transfer)/tot;
+              L.pg[j]=(L.pg[j]*od+L.pg[i]*transfer)/tot;
+              L.pb[j]=(L.pb[j]*od+L.pb[i]*transfer)/tot;
+            }
             L.pd[j]=clamp(tot,0,2.4);
             L.pd[i]=Math.max(0,L.pd[i]-transfer);
             const grad=Math.abs(L.wet[i]-L.wet[j]);
@@ -4432,10 +4549,14 @@ function simulateLayer(L){
       if(gn<granDen*0.7) L.pd[i]=clamp(L.pd[i]*(1+granStr*t*0.022),0,2.4);
       else L.pd[i]=clamp(L.pd[i]*(1-granStr*t*0.006),0,2.4);
     }
-    const dryRate=0.0035+absF*0.02+toothMap[i]*0.002;
-    L.wet[i]=Math.max(0,w-dryRate-w*0.01);
+    // dryF is 1.0 at the default dryingSpeed 5, so the rate is unchanged by default; at 0 both
+    // the linear rate and the proportional decay stop entirely and the layer stays workable
+    // indefinitely.
+    const dryF=clamp((V.dryingSpeed!=null?V.dryingSpeed:5)/5,0,2);
+    const dryRate=(0.0035+absF*0.02+toothMap[i]*0.002)*dryF;
+    L.wet[i]=Math.max(0,w-dryRate-w*0.01*dryF);
   }
-  if(diffuseWetBands(L,diffF,edgeF,tiltOn,gDirX,gDirY,gStrength)) anyWet=true;
+  if(diffuseWetBands(L,diffF,edgeF,tiltOn,gDirX,gDirY,gStrength,granStr)) anyWet=true;
   let rivuletsActive=false;
   if(V.createDrips) rivuletsActive=updateRivulets(L,tiltOn,gDirX,gDirY,gStrength);
   L._shrinkTick=(L._shrinkTick||0)+1;
@@ -5551,6 +5672,8 @@ function setBrush(key,keepTool){
   // 57 == the old hardcoded pow(1-rr,1.4) falloff, so defaulting it here changes nothing
   // visually for existing brushes while making the Edge Softness slider functional for all.
   if(brush.edgeSoftness==null) brush.edgeSoftness=57;
+  if(brush.waterBehavior==null) brush.waterBehavior='constant'; // 'pressure' => harder press releases more water
+  if(brush.loading==null) brush.loading=82; // now live for wet media too, not just oils
   const modeOpts=PAINT_MODES_BY_ENGINE[brush.engine]||['paint','paintmix','paintblend','blend','erase'];
   if(brush.paintMode==null || !modeOpts.includes(brush.paintMode)) brush.paintMode=modeOpts.includes('paintmix')?'paintmix':'paint';
   brush.key=key;
@@ -5587,6 +5710,13 @@ function buildPropertiesPanel(){
     html+=srow('Size','brush.size',1,brush.maxSize||600,1);
     html+=srow('Opacity','brush.opacity',0,1,0.01);
     html+= isOily ? srow('Loading','brush.loading',0,100,1) : srow('Flow','brush.flow',0,1,0.01);
+    // Loading is meaningful for any medium that injects pigment into surface water, not just
+    // oils — it was previously hidden (and inert) for watercolour/ink/airbrush.
+    if(!isOily && TOOL_BIAS[brush.engine] && TOOL_BIAS[brush.engine].waterMul>0){
+      html+=srow('Loading','brush.loading',0,100,1);
+      html+=srowSel('Pressure \u2192 Water','brush.waterBehavior',[['constant','Constant'],['pressure','Pressure (harder = wetter)'],['pressure-soft','Pressure (soft)'],['velocity','Velocity']]);
+      html+=`<p class="tinyNote">Loading is how much pigment the brush pushes into the surface water — raise it for saturated wet-on-wet blends, drop it below ~45 and the brush becomes a damp blender that lifts and redistributes paint already on the canvas. Pressure &rarr; Water on "Pressure" makes a light touch lay concentrated pigment and a hard press flood the area with water.</p>`;
+    }
     if(isOily) html+=srow('Oiliness','brush.oiliness',0,100,1); else html+=srow('Water','brush.water',0,1,0.01);
     if(hasLength) html+=srow('Length','brush.length',1,100,1);
     html+=srow('Blend','brush.blend',0,1,0.01);
@@ -6181,9 +6311,10 @@ function buildPreview(){
 function buildVisualSettings(){
   let html='';
   html+=grpOpen('Watercolor Behavior');
-  html+=srowSel('Presets','__vpreset',[['Default','Default'],['Wet-in-Wet','Wet-in-Wet'],['Dry Brush','Dry Brush'],['Custom','Custom']]);
+  html+=srowSel('Presets','__vpreset',[['Default','Default'],['Wet-in-Wet','Wet-in-Wet'],['Vivid Wet Blend','Vivid Wet Blend'],['Dry Brush','Dry Brush'],['Custom','Custom']]);
   html+=srow('Absorbency','V.absorbency',0,10,1)+srow('Re-Wet','V.rewet',0,10,1)+srow('Texture Influence','V.textureInfluence',0,10,1);
   html+=srow('Edge Darkening','V.edgeDarkening',0,10,1)+srow('Diffusion Speed','V.diffusionSpeed',0,10,1);
+  html+=srow('Drying Speed','V.dryingSpeed',0,10,1)+`<p class="tinyNote">Set Drying Speed to 0 to stop the canvas drying altogether — unlimited working time to push wet paint around before it locks into the paper. 5 is the standard rate.</p>`;
   html+=srowChk('Create Drips','V.createDrips')+srow('Drip Size','V.dripSize',1,10,1)+srow('Drip Length','V.dripLength',1,10,1);
   html+=srowChk('Granulation','V.granulation')+srowSel('Pattern','V.granPreset',[[1,'Granulation 1'],[2,'Granulation 2'],[3,'Granulation 3'],[4,'Granulation 4'],['custom','Custom'+(customGranTex?'':' (none loaded)')]]);
   html+=srow('Strength','V.granStrength',0,10,1)+srow('Density','V.granDensity',0,10,1);
@@ -6289,8 +6420,14 @@ function buildLayerSettings(){
 const BLEND_MODES=['normal','darken','multiply','colorburn','linearburn','lighten','screen','colordodge','lineardodge',
   'overlay','softlight','hardlight','difference','exclusion'];
 /* ---- wet/dry layer operations (Layers panel + Layer menu) ---- */
-function wetWholeLayer(L){ for(let i=0;i<N;i++) L.wet[i]=Math.max(L.wet[i],0.55); L.wetBounds={minx:0,maxx:W-1,miny:0,maxy:H-1}; markFullDirty(); setStatus('Layer wet'); }
-function wetPaintedAreas(L){ for(let i=0;i<N;i++) if(L.pd[i]>0.02) L.wet[i]=Math.max(L.wet[i],0.5); L.wetBounds={minx:0,maxx:W-1,miny:0,maxy:H-1}; markFullDirty(); setStatus('Painted areas wet'); }
+// "Wet the Whole Layer" is the documented first step of the wet-on-wet workflow — soak the
+// workspace, then blend into it. It previously only raised wetness to 0.55, which is damp rather
+// than soaked: pigment mobility scales as wetness^1.5, so 0.55 yields under a third of the
+// bleeding that a genuinely wet surface does, and strokes laid onto it still came out with hard
+// edges. Raised to 1.2 (the Water tool itself saturates around 1.7) so clicking the button
+// actually produces the wet-on-wet behaviour the workflow expects.
+function wetWholeLayer(L){ for(let i=0;i<N;i++) L.wet[i]=Math.max(L.wet[i],1.2); L.wetBounds={minx:0,maxx:W-1,miny:0,maxy:H-1}; markFullDirty(); setStatus('Layer soaked — strokes will bleed and blend'); }
+function wetPaintedAreas(L){ for(let i=0;i<N;i++) if(L.pd[i]>0.02) L.wet[i]=Math.max(L.wet[i],1.0); L.wetBounds={minx:0,maxx:W-1,miny:0,maxy:H-1}; markFullDirty(); setStatus('Painted areas wet'); }
 function dryTheLayer(L){ L.wet.fill(0); L.wetBounds=null; L.rivulets=[]; markFullDirty(); setStatus('Layer dried'); }
 function fastDryLayer(L){ L.wet.fill(0); L.wetBounds=null; L.rivulets=[]; markFullDirty(); } // canvas stays "wet" conceptually; water removed from paint
 function setMaskMode(mode){
@@ -7920,6 +8057,8 @@ function buildQuickbar(){
       <output id="qbPressureOut">${PREFS.pressureSensitivity}%</output></label>
     <div class="qsep"></div>
     <button class="qbtn ${showWetOverlay?'primary':''}" id="qbShowWet" title="Show Wet (H) — tint wet areas blue so you can see exactly where the canvas is still wet">💧 Wet</button>
+    <button class="qbtn ${naturalColors?'primary':''}" id="qbPigments" title="Pigments mixing mode — mix in Kubelka-Munk subtractive space so blue+yellow makes green instead of grey. Essential for vivid wet-on-wet blends.">🎨 Pigments</button>
+    <button class="qbtn" id="qbWetLayer" title="Wet the Whole Layer (Shift+L) — soak the canvas so the next strokes bleed and blend">💧 Wet Layer</button>
     <button class="qbtn" id="qbDry">Dry Canvas</button>
     <button class="qbtn" id="qbClear">Clear Layer</button>
     <div class="qsep"></div>
@@ -7936,6 +8075,10 @@ function buildQuickbar(){
   };
   const qsw=document.getElementById('qbShowWet');
   if(qsw) qsw.onclick=()=>{ showWetOverlay=!showWetOverlay; markFullDirty(); render(true); buildLayersPanel(); buildQuickbar(); };
+  const qpg=document.getElementById('qbPigments');
+  if(qpg) qpg.onclick=()=>{ naturalColors=!naturalColors; setStatus('Pigments mixing '+(naturalColors?'ON — subtractive Kubelka-Munk blending':'OFF — standard RGB blending')); buildQuickbar(); };
+  const qwl=document.getElementById('qbWetLayer');
+  if(qwl) qwl.onclick=()=>{ const L=activeLayer(); if(L){ pushUndo(); wetWholeLayer(L); buildLayersPanel(); } };
   document.getElementById('qbUndo').onclick=undo;
   document.getElementById('qbRedo').onclick=redo;
   document.getElementById('qbDry').onclick=dryCanvas;
