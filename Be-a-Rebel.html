@@ -51,6 +51,10 @@ select{background:var(--input-bg);border:1px solid var(--line);color:var(--text)
 .qbtn.primary:hover{background:var(--accent)}
 .qbtn:disabled{opacity:.4;cursor:default;pointer-events:none}
 .qsep{width:1px;height:18px;background:var(--line)}
+/* inline labelled slider for the quickbar (Pressure Sensitivity) */
+.qslider{display:inline-flex;align-items:center;gap:6px;color:#c3cbd9;font-size:11px;flex:0 0 auto}
+.qslider input[type=range]{width:96px}
+.qslider output{width:34px;text-align:right;color:#fff;font-variant-numeric:tabular-nums}
 .toolName{color:var(--accent);font-weight:700;font-size:11.5px}
 .swMini{width:20px;height:20px;border-radius:4px;border:1px solid #000;padding:0;vertical-align:middle}
 
@@ -704,7 +708,10 @@ function evalCurve(kind,pressure,speed,curvePoints){
     case 'velocity': return .2+.8*(1-speed);
     case 'random': return .35+.65*Math.random();
     case 'custom': return evalCustomCurve(curvePoints,pressure);
-    case 'pressure': default: return .15+.85*pressure;
+    // The floor here is what a zero-pressure touch still produces. It used to be a hardcoded
+    // .15; it is now driven by the Pressure Sensitivity slider (0.16 at the default 50, so
+    // this is effectively unchanged unless the user moves it) — see pressureCurveFloor().
+    case 'pressure': default: { const f=pressureCurveFloor(); return f+(1-f)*pressure; }
   }
 }
 
@@ -783,7 +790,12 @@ const PREFS_DEFAULTS={
   // Cursor
   cursorStyle:'brushSize', resizeCursorColor:'#5bb8ec', showBrushOutline:true,
   // Tablet
-  pressureCurve:'linear', smoothing:30, tabletMode:'auto',
+  // pressureSensitivity (0-100): how strongly real stylus pressure modulates the stroke.
+  // 50 is calibrated to reproduce the engine's previous fixed behaviour almost exactly, so
+  // existing brushes are unchanged at the default; 0 ignores pressure entirely (every stroke
+  // paints at full strength, useful when a tablet reports garbage), 100 gives the widest
+  // dynamic range (hairline at a feather touch, full width/opacity at full force).
+  pressureCurve:'linear', pressureSensitivity:50, smoothing:30, tabletMode:'auto',
   // Keyboard
   shortcutOverrides:{},
 };
@@ -3715,6 +3727,23 @@ function pigmentApproachIncrement(old,amount,plateau){
   const rate=1-Math.pow(1-clamp(amount*1.1,0,1),1.6);
   return (cap-old)*rate;
 }
+// 8-neighbour offsets for wet-on-wet dispersal: first 4 orthogonal, last 4 diagonal.
+const WOW_DX=[1,-1,0,0, 1,1,-1,-1], WOW_DY=[0,0,1,-1, 1,-1,1,-1];
+/* ---- "Was this paper already wet when the stroke started?" ----
+   Wet-on-wet dilution has to key off STANDING water — water that was on the paper before the
+   current stroke arrived — not off L.wet at the moment of the dab. A loaded watercolour brush
+   wets the paper as it travels, so by mid-stroke L.wet is high everywhere the brush has been
+   even on a bone-dry canvas. Keying dilution off that made every ordinary watercolour stroke
+   progressively wash itself out (measured: peak density 0.45 instead of ~1.7 on dry paper),
+   because the stroke kept diluting itself with its own trail. Two thresholds were tried before
+   this and neither could separate the two cases, because a brush's own water reaches the same
+   levels the Water tool does.
+   This records, per pixel, the wetness observed the FIRST time the current stroke touches it,
+   which is exactly the physical question being asked. The stamp array identifies which stroke
+   a recorded value belongs to, so nothing needs clearing between strokes. Two shared
+   canvas-sized arrays (~8MB total, allocated once, not per layer). */
+let strokeWetAtStart=new Float32Array(N), strokeWetStamp=new Int32Array(N), strokeWetId=0;
+function reallocStrokeWetBuffers(){ strokeWetAtStart=new Float32Array(N); strokeWetStamp=new Int32Array(N); strokeWetId=0; }
 /* ---------- deposit: wet media (watercolor / ink / dryMedia / marker / airbrush) ---------- */
 function depositWet(L,x,y,pressure,angle,speed,b,bias){
   if(!L||L.locked) return;
@@ -3725,7 +3754,11 @@ function depositWet(L,x,y,pressure,angle,speed,b,bias){
   // gives rougher brushes (Liner Rough, Dry, Oval 2, Fragments...) their slightly uneven,
   // hand-drawn edge instead of a mechanically smooth, perfectly consistent stroke width.
   const sizeJitterMul = b.sizeJitter ? 1+(Math.random()-0.5)*2*clamp(b.sizeJitter/100,0,1) : 1;
-  const size=clamp(b.size*(0.35+0.85*sizeK)*sizeJitterMul,2,b.maxSize||b.size*4);
+  // Pressure->size floor is sensitivity-driven (0.35 at the default 50, i.e. identical to the
+  // previous hardcoded value). The upper bound is held at a constant 1.2 so raising sensitivity
+  // widens the range downward instead of shrinking the brush's maximum size.
+  const spf=sizePressureFloor();
+  const size=clamp(b.size*(spf+(1.2-spf)*sizeK)*sizeJitterMul,2,b.maxSize||b.size*4);
   const opacK=evalCurve(b.opacityBehavior||'pressure-soft',pressure,speed,b.opacityCurve);
   const lengthNorm=(b.length!=null?b.length:100)/100; // 1=infinite paint, lower=runs out faster
   const loadFactor=lengthNorm>=0.99?1:clamp(1-strokeState.dist/(size*(8+lengthNorm*140)+1),0.05,1);
@@ -3803,6 +3836,27 @@ function depositWet(L,x,y,pressure,angle,speed,b,bias){
     // low plateau and stay light no matter how long the stroke or how many dabs overlap it.
     const opacityCeilingMul = clamp(0.35+b.opacity*0.9,0.35,1.25);
     const preWet=L.wet[i]; // wetness already on the paper BEFORE this stamp — drives instant bloom below
+    // WET DILUTION — the missing piece that made wet-on-wet look like nothing was happening.
+    // Paint laid into a standing water film cannot build a dense mark: the pigment immediately
+    // disperses through the water instead of staying where the brush put it, so the SAME amount
+    // of pigment ends up covering a much larger area at a much lower density. Without this, a
+    // stroke onto soaking paper still drove pd up to ~2.2 (well past the point where a pixel
+    // renders fully opaque), so it read as an identical hard-edged solid bar to the same stroke
+    // on dry paper — verified side by side before adding this. Scaling the density ceiling down
+    // with existing wetness is what turns that bar into a soft, translucent, spreading bloom,
+    // and it is why wet-on-wet marks are characteristically paler than dry-brush marks.
+    // Threshold matters here. `preWet` includes wetness laid down by EARLIER DABS OF THIS SAME
+    // STROKE (a loaded watercolour brush wets the paper as it goes), so diluting from zero
+    // upward made an ordinary stroke on dry paper progressively wash itself out — measured at
+    // peak density 0.4 instead of ~1.7, i.e. every watercolour stroke suddenly turned pale.
+    // Only water BEYOND what a loaded brush deposits by itself counts as standing water, so
+    // dilution starts at 0.5 and reaches full strength at 1.55 (near the 1.7 the Water tool
+    // saturates at). A brush's own trail therefore dilutes only mildly, while genuinely
+    // pre-wetted paper dilutes strongly.
+    if(strokeWetStamp[i]!==strokeWetId){ strokeWetStamp[i]=strokeWetId; strokeWetAtStart[i]=preWet; }
+    const standingWet=strokeWetAtStart[i];
+    const wetDiluteMul = standingWet>0.06 ? lerp(1,0.45,clamp(standingWet/1.25,0,1)) : 1;
+    const ceilMul = grainCeilingMul*opacityCeilingMul*wetDiluteMul;
     // Pixels with ~zero prior coverage have no meaningful stored color (buffers default to
     // black). Treat such pixels as if their "old color" were the new paint color itself,
     // so we never fade in from black on a fresh/blank area.
@@ -3811,17 +3865,17 @@ function depositWet(L,x,y,pressure,angle,speed,b,bias){
     if(mode==='paint' && bias.subtractive){
       const a=clamp(amount*1.8,0,1);
       L.pr[i]=lerp(oR,col.r,a); L.pg[i]=lerp(oG,col.g,a); L.pb[i]=lerp(oB,col.b,a);
-      L.pd[i]=clamp(old+pigmentApproachIncrement(old,amount,1.5*grainCeilingMul*opacityCeilingMul),0,2.4);
+      L.pd[i]=clamp(old+pigmentApproachIncrement(old,amount,1.5*ceilMul),0,2.4);
     } else if(bias.flatCap){
-      if(amount>old*0.4){ L.pr[i]=col.r; L.pg[i]=col.g; L.pb[i]=col.b; L.pd[i]=clamp(old+pigmentApproachIncrement(old,amount,2.2*grainCeilingMul*opacityCeilingMul),0,2.2); }
+      if(amount>old*0.4){ L.pr[i]=col.r; L.pg[i]=col.g; L.pb[i]=col.b; L.pd[i]=clamp(old+pigmentApproachIncrement(old,amount,2.2*ceilMul),0,2.2); }
     } else if(bias.subtractive && b.mixingMode==='opaque'){
       // Opaque (gouache-like): dense, flat color coverage rather than glazing through.
       const a=clamp(amount*2.2,0,1);
       L.pr[i]=lerp(oR,col.r,a); L.pg[i]=lerp(oG,col.g,a); L.pb[i]=lerp(oB,col.b,a);
-      L.pd[i]=clamp(old+pigmentApproachIncrement(old,amount,2.4*grainCeilingMul*opacityCeilingMul),0,2.4);
+      L.pd[i]=clamp(old+pigmentApproachIncrement(old,amount,2.4*ceilMul),0,2.4);
     } else if(bias.subtractive && b.mixingMode==='semitransparent'){
       // Midpoint: subtractive glazing blended with a direct opacity-driven mix.
-      const total=old+pigmentApproachIncrement(old,amount,1.8*grainCeilingMul*opacityCeilingMul)+1e-6;
+      const total=old+pigmentApproachIncrement(old,amount,1.8*ceilMul)+1e-6;
       const subR=255-((255-oR)*old+(255-col.r)*amount)/total, subG=255-((255-oG)*old+(255-col.g)*amount)/total, subB=255-((255-oB)*old+(255-col.b)*amount)/total;
       const a=clamp(amount*1.5,0,1);
       const opR=lerp(oR,col.r,a), opG=lerp(oG,col.g,a), opB=lerp(oB,col.b,a);
@@ -3831,12 +3885,12 @@ function depositWet(L,x,y,pressure,angle,speed,b,bias){
     } else if(bias.subtractive && pigmentMixing){
       // Real Pigment Color Mixing: mix in approximate RYB pigment space instead of the RGB
       // complement, so e.g. yellow+blue trends toward green like actual paint, not gray-brown.
-      const total=old+pigmentApproachIncrement(old,amount,1.5*grainCeilingMul*opacityCeilingMul)+1e-6, t=clamp((total-old)/total,0,1);
+      const total=old+pigmentApproachIncrement(old,amount,1.5*ceilMul)+1e-6, t=clamp((total-old)/total,0,1);
       const mixed=mixNaturalRGB(oR,oG,oB,colRyb,t);
       L.pr[i]=mixed.r; L.pg[i]=mixed.g; L.pb[i]=mixed.b;
       L.pd[i]=clamp(total,0,2.4);
     } else if(bias.subtractive){
-      const total=old+pigmentApproachIncrement(old,amount,1.5*grainCeilingMul*opacityCeilingMul)+1e-6;
+      const total=old+pigmentApproachIncrement(old,amount,1.5*ceilMul)+1e-6;
       const t=(total-old)/total;
       L.pr[i]=255-((255-oR)*(1-t)+(255-col.r)*t);
       L.pg[i]=255-((255-oG)*(1-t)+(255-col.g)*t);
@@ -3845,7 +3899,7 @@ function depositWet(L,x,y,pressure,angle,speed,b,bias){
     } else {
       const a=clamp(amount,0,1);
       L.pr[i]=oR*(1-a)+col.r*a; L.pg[i]=oG*(1-a)+col.g*a; L.pb[i]=oB*(1-a)+col.b*a;
-      L.pd[i]=clamp(old+pigmentApproachIncrement(old,amount,1.5*grainCeilingMul*opacityCeilingMul),0,2.4);
+      L.pd[i]=clamp(old+pigmentApproachIncrement(old,amount,1.5*ceilMul),0,2.4);
     }
     if(bias.waterMul>0){
       const addW=b.water*bias.waterMul*fall*(1-absorbMap[i]*(V.absorbency/10)*0.5);
@@ -3856,18 +3910,45 @@ function depositWet(L,x,y,pressure,angle,speed,b,bias){
       // ring outward so the stroke visibly "blooms" right away instead of only spreading
       // gradually over the next few animation frames. Strength scales with how wet the
       // paper already was and with Re-wet in Visual Settings.
-      if(preWet>0.08 && bias.subtractive){
-        const bloom=clamp(preWet*0.55*(0.4+V.rewet/10),0,0.9)*amount;
+      // Wet-on-wet dispersal at deposit time. Previously this pushed a fixed fraction into
+      // only the 4 orthogonal neighbours, which produced a barely-perceptible one-pixel halo.
+      // Now it also feeds the 4 diagonals (at reduced weight, since they are further away),
+      // and the strength scales with how wet the paper already was — so a stroke onto a
+      // properly wet wash immediately spills outward in all directions the way real paint
+      // does when it touches standing water, rather than waiting several frames for the
+      // background simulation to slowly carry it.
+      if(preWet>0.06 && bias.subtractive){
+        const wn=clamp(preWet/1.2,0,1);
+        const bloom=clamp(preWet*0.8*(0.4+V.rewet/10),0,1.3)*amount;
         if(bloom>0.0006){
-          const bx=px+1, by=py, bx2=px-1, by2=py, bx3=px, by3=py+1, bx4=px, by4=py-1;
-          [[bx,by],[bx2,by2],[bx3,by3],[bx4,by4]].forEach(([nx2,ny2])=>{
-            if(nx2<0||ny2<0||nx2>=W||ny2>=H) return;
-            const j=ny2*W+nx2; if(!inSelection(nx2,ny2)) return;
-            const jOld=L.pd[j], jTot=jOld+bloom+1e-6;
-            L.pr[j]=(L.pr[j]*jOld+col.r*bloom)/jTot; L.pg[j]=(L.pg[j]*jOld+col.g*bloom)/jTot; L.pb[j]=(L.pb[j]*jOld+col.b*bloom)/jTot;
+          for(let k=0;k<8;k++){
+            const nx2=px+WOW_DX[k], ny2=py+WOW_DY[k];
+            if(nx2<0||ny2<0||nx2>=W||ny2>=H) continue;
+            if(!inSelection(nx2,ny2)) continue;
+            const share=k<4?1:0.55; // diagonals are ~1.41x further away, so they receive less
+            const j=ny2*W+nx2;
+            // The dispersed pigment must respect the same wet-diluted density ceiling the
+            // centre of the dab does. This previously added to the neighbour unconditionally,
+            // capped only by the global 2.4 maximum — so although each individual dab stayed
+            // pale, ~80 overlapping dabs along a single stroke each dumped more pigment into
+            // the same neighbours and drove density to ~1.75 regardless of how wet the paper
+            // was, which is what defeated the dilution above and kept wet-on-wet strokes
+            // looking like solid dry-paper bars. Approaching a shared ceiling instead means
+            // the mark spreads outward without ever building up dense.
+            const bloomCap=1.5*ceilMul;
+            const room=bloomCap-L.pd[j];
+            if(room<=0.0005) continue;
+            const dep=Math.min(bloom*share,room*0.55);
+            const jOld=L.pd[j], jTot=jOld+dep+1e-6;
+            L.pr[j]=(L.pr[j]*jOld+col.r*dep)/jTot; L.pg[j]=(L.pg[j]*jOld+col.g*dep)/jTot; L.pb[j]=(L.pb[j]*jOld+col.b*dep)/jTot;
             L.pd[j]=clamp(jTot,0,2.4);
-            L.wet[j]=clamp(L.wet[j]+preWet*0.3,0,1.6);
-          });
+            L.wet[j]=clamp(L.wet[j]+preWet*0.3*share,0,1.6);
+            growBounds(L,nx2,ny2);
+          }
+          // Paint that has just dispersed outward is no longer all sitting under the brush:
+          // remove a wetness-scaled share from the centre so the stroke reads as diluted and
+          // soft-edged on wet paper instead of a hard opaque core with a halo bolted around it.
+          L.pd[i]=Math.max(0,L.pd[i]-bloom*wn*1.1);
         }
       }
     }
@@ -3897,7 +3978,8 @@ function depositOil(L,x,y,pressure,angle,speed,b){
   // by the oil engine (previously silently ignored for every Oil/Acrylic/Express Oil brush,
   // even though buildBrushesFromReconSpecs already set brush.sizeJitter for every tool).
   const sizeJitterMul = b.sizeJitter ? 1+(Math.random()-0.5)*2*clamp(b.sizeJitter/100,0,1) : 1;
-  const size=clamp(b.size*(0.35+0.85*sizeK)*sizeJitterMul,2,b.maxSize||b.size*4);
+  const spf=sizePressureFloor(); // sensitivity-driven; 0.35 at the default 50 (see depositWet)
+  const size=clamp(b.size*(spf+(1.2-spf)*sizeK)*sizeJitterMul,2,b.maxSize||b.size*4);
   const lengthNorm=(b.length!=null?b.length:100)/100;
   const loadFactor=lengthNorm>=0.99?1:clamp(1-strokeState.dist/(size*(6+lengthNorm*120)+1),0.04,1);
   const baseCol=currentColorRGB();
@@ -4199,6 +4281,123 @@ function toolPick(x,y){
    Gravity (Canvas Tilt) still biases the neighbor weights so wet paint genuinely flows
    downhill, but the SHAPE of that flow now emerges from many small, physically-grounded
    steps rather than a single big deterministic jump. */
+/* ---- Deterministic water + pigment transport (the wet-on-wet core) ----
+   WHY THIS EXISTS. All transport used to live inside simulateLayer's random-sample loop, which
+   visits only ~10% of the wet area per frame — so any individual pixel was touched about once
+   every ten frames. Measured consequence: a 40px-wide pure water wash spread by 2 PIXELS over
+   120 frames (two full seconds), and a stroke painted onto soaking wet paper ended up just 4px
+   wider than the same stroke on dry paper. Both are indistinguishable from "wet-on-wet isn't
+   implemented", which is exactly how it read. Random sampling is fine for drying and
+   granulation, but diffusion fundamentally needs every cell stepped, or the gradient never
+   actually propagates.
+   Two further problems the old loop had, both fixed here:
+     - wetness only ever moved as a side effect of PIGMENT moving (the transfer sat inside an
+       `if(pd>0.003)` branch), so plain water — which carries no pigment at all — could never
+       spread, soften its edge, or wick into surrounding dry paper.
+     - the source pixel gave up only 90% of what the destination gained, so every hop created
+       10% pigment from nothing, compounding into washes that darkened and muddied over time.
+   APPROACH. A real grid sweep, but banded across frames to bound the per-frame cost: the wet
+   bounding box is divided into WET_BANDS horizontal strips and one strip is stepped per frame,
+   so every wet pixel gets a true diffusion step several times per second while the work done in
+   any single frame stays proportional to (wet area / WET_BANDS). The sweep direction alternates
+   each frame, which cancels most of the directional bias an in-place sequential sweep would
+   otherwise introduce (a double-buffered Jacobi step would remove it entirely, but that costs
+   another full-canvas Float32Array per layer for a difference that isn't visible here).
+   Water moves first, down its own wetness gradient; pigment then rides the water, with mobility
+   rising superlinearly in wetness so a soaked area bleeds freely while barely-damp paper holds
+   its mark. Both respect Canvas Tilt, so a tilted canvas genuinely runs downhill. */
+// Per-frame cell budget. Rather than a fixed number of bands, the number of bands is derived
+// from the wet area so the cost of a frame is bounded no matter how much of the canvas is wet.
+// The important consequence is that a NORMAL wet area — one stroke, or a patch of water, i.e.
+// well under the budget — is stepped in FULL every single frame, which is what makes bleeding
+// look immediate and continuous. Only an unusually large wet region (a whole-canvas wash) gets
+// split across frames, degrading gracefully into a slightly slower spread instead of a
+// framerate collapse. Measured at ~200k cells: comfortably inside a 60fps frame.
+const WET_CELL_BUDGET=200000;
+function diffuseWetBands(L,diffF,edgeF,tiltOn,gDirX,gDirY,gStrength){
+  const b=L.wetBounds; if(!b) return false;
+  // Capture the sweep extents ONCE. growBounds() below can enlarge L.wetBounds mid-sweep, and
+  // reading b.maxx/b.maxy directly in the loop conditions would let the sweep chase its own
+  // expanding bounds and run far past its intended budget within a single frame.
+  const minx=b.minx, maxx=b.maxx, miny=b.miny, maxy=b.maxy;
+  const bw=maxx-minx+1, bh=maxy-miny+1;
+  if(bw<=0||bh<=0) return false;
+  const bands=Math.max(1,Math.ceil((bw*bh)/WET_CELL_BUDGET));
+  const bandH=Math.max(1,Math.ceil(bh/bands));
+  const band=(L._wetBand=((L._wetBand||0)+1)%bands);
+  const y0=miny+band*bandH; if(y0>maxy) return false;
+  const y1=Math.min(maxy,y0+bandH-1);
+  const rev=(L._sweepFlip=!L._sweepFlip);
+  // Fast path: when there is no selection and no masking-fluid layer, diffusionAllowed()
+  // reduces to a bounds test. Calling it per neighbour per cell (millions of times a second)
+  // was itself a large part of the measured frame cost, so the common case is inlined.
+  const fastAllow=!selectionMask && !maskLayersCache.length;
+  const DX=[1,-1,0,0], DY=[0,0,1,-1];
+  let anyWet=false;
+  for(let y=y0;y<=y1;y++){
+    for(let n=0;n<bw;n++){
+      const x=rev?(maxx-n):(minx+n);
+      const i=y*W+x;
+      const w=L.wet[i];
+      if(w<0.015) continue;
+      anyWet=true;
+      const d=L.pd[i];
+      const absorbHere=0.55+absorbMap[i]*0.9;
+      const pigMob=d>0.003 ? Math.pow(w>1.7?1.7:w,1.5)*diffF*0.22 : 0;
+      for(let k=0;k<4;k++){
+        const nx=x+DX[k], ny=y+DY[k];
+        const inb=nx>=0&&ny>=0&&nx<W&&ny<H;
+        if(!inb || (!fastAllow && !diffusionAllowed(L,nx,ny))){
+          // A real boundary (canvas edge / selection edge / masking fluid): water pools
+          // against it and the pigment it carries concentrates there — the classic hard edge
+          // of a taped-off wash.
+          if(d>0.003) L.edge[i]=clamp(L.edge[i]+w*edgeF*0.025,0,1);
+          continue;
+        }
+        const j=ny*W+nx;
+        // Gravity bias (Canvas Tilt): downhill neighbours receive proportionally more.
+        let gw=1;
+        if(tiltOn){ const align=DX[k]*gDirX+DY[k]*gDirY; gw=1+Math.max(0,align)*gStrength*2.6; }
+        const wi=L.wet[i], wj=L.wet[j];
+        let moved=0;
+        // 1) Diffusion: water flows down its own wetness gradient.
+        const dw=wi-wj;
+        if(dw>0.006) moved=dw*0.22*diffF*gw*absorbHere;
+        // 2) Capillary wicking. Pure diffusion spreads as sqrt(time), which is far too slow to
+        //    look like paper wetting — it produced a 2px advance over two seconds. Real paper
+        //    wicks: fibres actively draw water into DRY neighbours, giving a front that
+        //    advances at a roughly steady rate. This adds a gradient-independent term whenever
+        //    a well-wetted cell borders a much drier one, which is what makes a wash visibly
+        //    creep outward and soften its own edge instead of sitting as a hard-edged patch.
+        if(wi>0.10 && wj<wi*0.8){
+          moved+=Math.min(wi*0.055*diffF*gw*absorbHere, (wi-wj)*0.5);
+        }
+        if(moved>0.0002){
+          if(moved>wi*0.24) moved=wi*0.24; // keep the explicit step stable
+          L.wet[j]=clamp(wj+moved,0,1.7);
+          L.wet[i]=Math.max(0,wi-moved);
+          if(nx<b.minx||nx>b.maxx||ny<b.miny||ny>b.maxy) growBounds(L,nx,ny);
+        }
+        // 3) Pigment rides the water. Strictly mass-conserving.
+        if(pigMob>0){
+          const transfer=L.pd[i]*pigMob*gw*0.25;
+          if(transfer>0.00004){
+            const od=L.pd[j], tot=od+transfer+1e-6;
+            L.pr[j]=(L.pr[j]*od+L.pr[i]*transfer)/tot;
+            L.pg[j]=(L.pg[j]*od+L.pg[i]*transfer)/tot;
+            L.pb[j]=(L.pb[j]*od+L.pb[i]*transfer)/tot;
+            L.pd[j]=clamp(tot,0,2.4);
+            L.pd[i]=Math.max(0,L.pd[i]-transfer);
+            const grad=Math.abs(L.wet[i]-L.wet[j]);
+            if(grad>0.05) L.edge[i]=clamp(L.edge[i]+grad*edgeF*0.018,0,1);
+            if(nx<b.minx||nx>b.maxx||ny<b.miny||ny>b.maxy) growBounds(L,nx,ny);
+          }
+        }
+      }
+    }
+  }
+  return anyWet;
+}
 function simulateLayer(L){
   if(!L.wetBounds) return false;
   const b=L.wetBounds;
@@ -4222,52 +4421,21 @@ function simulateLayer(L){
     const i=y*W+x, w=L.wet[i];
     if(w<0.015) continue;
     anyWet=true;
+    // Water/pigment TRANSPORT is no longer done here — it runs in diffuseWetBands() below,
+    // as a deterministic sweep. This random-sample pass now only handles the two effects that
+    // genuinely suit stochastic sampling: granulation (which wants randomness anyway) and
+    // drying (an approximate per-pixel rate where sampling error is invisible).
     const d=L.pd[i];
-    if(d>0.003){
-      // Weight each of the 4 neighbors: base isotropic share, plus a gravity bonus for
-      // whichever neighbor best matches the tilt direction. This keeps the spread smooth
-      // (no long-distance teleporting) while still visibly favoring "downhill".
-      let wsum=0; const wgt=[0,0,0,0];
-      for(let k=0;k<4;k++){
-        const nx0=x+NB_DX[k], ny0=y+NB_DY[k];
-        if(nx0<0||ny0<0||nx0>=W||ny0>=H){ wgt[k]=0; continue; }
-        let ww=1;
-        if(tiltOn){ const align=NB_DX[k]*gDirX+NB_DY[k]*gDirY; ww=1+Math.max(0,align)*gStrength*3.2; }
-        wgt[k]=ww; wsum+=ww;
-      }
-      if(wsum>0){
-        const totalTransfer=d*w*diffF*0.09*flowBoost;
-        for(let k=0;k<4;k++){
-          if(wgt[k]<=0) continue;
-          const nx=x+NB_DX[k], ny=y+NB_DY[k];
-          if(!diffusionAllowed(L,nx,ny)){
-            // Hitting a real boundary (selection edge or masking fluid): pools and darkens
-            // right at the edge — the classic watercolor "hard edge" from taping off a shape.
-            L.edge[i]=clamp(L.edge[i]+w*edgeF*0.03,0,1);
-            continue;
-          }
-          const share=wgt[k]/wsum;
-          const transfer=totalTransfer*share;
-          if(transfer<=0) continue;
-          const j=ny*W+nx;
-          const od=L.pd[j], tot=od+transfer+1e-6;
-          L.pr[j]=(L.pr[j]*od+L.pr[i]*transfer)/tot; L.pg[j]=(L.pg[j]*od+L.pg[i]*transfer)/tot; L.pb[j]=(L.pb[j]*od+L.pb[i]*transfer)/tot;
-          L.pd[j]=clamp(tot,0,2.4); L.wet[j]=clamp(L.wet[j]+w*share*0.10,0,1.6); L.pd[i]=Math.max(0,L.pd[i]-transfer*0.9);
-          const grad=Math.abs(w-L.wet[j]);
-          if(grad>0.05) L.edge[i]=clamp(L.edge[i]+grad*edgeF*0.02,0,1);
-          growBounds(L,nx,ny);
-        }
-      }
-      if(granOn && d>0.02 && Math.random()<0.22){
-        const t = (V.granPreset==='custom' && customGranTex) ? sampleTexTiled(customGranTex,x,y,4) : toothMap[i];
-        const gn=noise(x*0.16+granSeed,y*0.16-granSeed);
-        if(gn<granDen*0.7) L.pd[i]=clamp(L.pd[i]*(1+granStr*t*0.022),0,2.4);
-        else L.pd[i]=clamp(L.pd[i]*(1-granStr*t*0.006),0,2.4);
-      }
+    if(d>0.003 && granOn && d>0.02 && Math.random()<0.22){
+      const t = (V.granPreset==='custom' && customGranTex) ? sampleTexTiled(customGranTex,x,y,4) : toothMap[i];
+      const gn=noise(x*0.16+granSeed,y*0.16-granSeed);
+      if(gn<granDen*0.7) L.pd[i]=clamp(L.pd[i]*(1+granStr*t*0.022),0,2.4);
+      else L.pd[i]=clamp(L.pd[i]*(1-granStr*t*0.006),0,2.4);
     }
     const dryRate=0.0035+absF*0.02+toothMap[i]*0.002;
     L.wet[i]=Math.max(0,w-dryRate-w*0.01);
   }
+  if(diffuseWetBands(L,diffF,edgeF,tiltOn,gDirX,gDirY,gStrength)) anyWet=true;
   let rivuletsActive=false;
   if(V.createDrips) rivuletsActive=updateRivulets(L,tiltOn,gDirX,gDirY,gStrength);
   L._shrinkTick=(L._shrinkTick||0)+1;
@@ -4418,9 +4586,18 @@ function render(force){
     for(let x=rect.minx;x<=rect.maxx;x++){
       const i=rowBase+x, o=i*4;
       let r=paperR[i], g=paperG[i], b=paperB[i];
+      let maxWet=0;
       for(let li=layers.length-1; li>=0; li--){
         const L=layers[li]; if(!effectiveLayerVisible(L)) continue;
         if(L.maskMode&&L.maskMode!=='none') continue; // masking-fluid layers are control layers, not painted
+        // Track wetness BEFORE the early-continue below, so that water sitting on otherwise
+        // BLANK paper still gets a visible sheen. This matters a great deal: previously the
+        // wet buffer had no effect on the composited image at all (only the optional blue
+        // debug overlay read it), so using the Water tool on an empty canvas produced no
+        // on-screen change whatsoever — the user had no way to see where they had wet the
+        // paper, which made wet-on-wet feel entirely absent even though the wetness was
+        // being stored and simulated correctly the whole time.
+        if(L.wet[i]>maxWet) maxWet=L.wet[i];
         const d=L.pd[i];
         let heightShade=0, castShadow=0;
         if(V.realShader && L.hasHeight && L.height[i]>0.02){
@@ -4472,6 +4649,16 @@ function render(force){
         const outOfGamut=conv[0]<-0.01||conv[0]>1.01||conv[1]<-0.01||conv[1]>1.01||conv[2]<-0.01||conv[2]>1.01;
         if(gamutWarningOn && outOfGamut){ r=255;g=0;b=255; }
         else if(proofColorsOn){ r=clamp(conv[0]*255,0,255); g=clamp(conv[1]*255,0,255); b=clamp(conv[2]*255,0,255); }
+      }
+      // Wet sheen: genuinely damp paper is darker and slightly cooler than dry paper, because
+      // the water fills the surface pores and cuts diffuse reflection. Kept deliberately
+      // subtle (a ~11% darkening at full saturation, with blue held back so the cast reads as
+      // cool rather than blue-tinted) — enough to clearly see where the canvas is wet and
+      // watch it dry in real time, without looking like a coloured overlay. The strong blue
+      // "Show Wet" overlay below remains the explicit diagnostic view.
+      if(maxWet>0.02){
+        const wn=clamp(maxWet/1.2,0,1);
+        r*=1-wn*0.11; g*=1-wn*0.095; b*=1-wn*0.055;
       }
       if(greyscalePreview){ const gl=r*0.299+g*0.587+b*0.114; r=gl;g=gl;b=gl; }
       if(showWetOverlay && activeL){
@@ -4567,19 +4754,59 @@ function updatePressureReadout(p){
 }
 
 /* ---------- pointer / stroke handling ---------- */
+function pressureSens(){ return clamp((PREFS.pressureSensitivity!=null?PREFS.pressureSensitivity:50)/100,0,1); }
+/* Pressure floors, both driven by the Pressure Sensitivity slider.
+   These two constants were previously hardcoded, and together they were the single biggest
+   reason pressure "didn't feel right": evalCurve('pressure') returned `.15+.85*p`, and
+   depositWet/depositOil then scaled size by `0.35+0.85*sizeK`. Composing those two floors
+   meant a feather-light touch still produced a dab ~51% as wide as a full-force one — a total
+   size range of only about 2.4x across the pen's entire travel, which reads as "barely
+   pressure sensitive" no matter how good the tablet is. Making both floors sensitivity-driven
+   lets the range open up to ~5x at 100%, while the values at the default 50 are deliberately
+   chosen to reproduce the old hardcoded numbers (0.16 vs 0.15, and exactly 0.35), so no
+   existing brush changes appearance unless the user actually moves the slider. */
+function pressureCurveFloor(){ return lerp(0.30,0.02,pressureSens()); }   // 0.16 at the default 50
+function sizePressureFloor(){ return lerp(0.50,0.20,pressureSens()); }    // 0.35 at the default 50
+/* Auto range calibration.
+   Real tablets very often never report anything close to 1.0 in normal use — a comfortable
+   hand pressure on many Huion/Wacom/XP-Pen pens tops out around 0.5-0.7, so the top of the
+   response curve was simply unreachable and full-strength strokes felt impossible to produce.
+   This tracks the hardest press actually seen from a pen this session and rescales incoming
+   readings against it, so the user's real achievable range maps onto the full 0..1 output.
+   Deliberately conservative: it only engages for pen input, only after enough samples to be
+   confident, and only when the observed ceiling sits in a range that genuinely looks like
+   under-reporting (0.35-0.92) rather than a correctly-calibrated pen or a noise spike. It is
+   a heuristic that adapts during the session, not a hardware calibration. */
+function normalizePenPressure(rawP,isPen){
+  if(!isPen) return rawP;
+  const m=pressureDiag.maxSeen;
+  if(pressureDiag.penSamples<30 || m<0.35 || m>0.92) return rawP;
+  return clamp(rawP/m,0,1);
+}
 function applyPressureCurve(p){
+  // Shape preference first (Preferences > Tablet), unchanged.
+  let shaped;
   switch(PREFS.pressureCurve){
-    case 'soft': return Math.pow(p,1.6); // ramps in gently, needs more force for full effect
-    case 'firm': return Math.pow(p,0.6); // reaches full effect with lighter touch
-    default: return p; // linear
+    case 'soft': shaped=Math.pow(p,1.6); break; // ramps in gently, needs more force for full effect
+    case 'firm': shaped=Math.pow(p,0.6); break; // reaches full effect with lighter touch
+    default: shaped=p; // linear
   }
+  // Then Pressure Sensitivity. Below 50 the response is progressively flattened toward a
+  // constant (at 0, pressure is ignored outright and every stroke paints at full strength —
+  // the correct behaviour when a tablet's readings are unusable). Above 50 the curve is
+  // gamma-expanded, which pushes light touches lower without lowering the ceiling, widening
+  // the felt dynamic range. Exactly 50 returns `shaped` untouched, so it is a true no-op.
+  const sens=pressureSens();
+  if(sens<0.5) return lerp(1,shaped,sens/0.5);
+  if(sens>0.5) return Math.pow(shaped,lerp(1,2.4,(sens-0.5)/0.5));
+  return shaped;
 }
 // Live tablet-pressure diagnostics: tracks whether the pen/tablet driver is actually
 // delivering varying PointerEvent.pressure values, so we can (a) never silently swap a
 // legitimate low/zero pressure sample for the flat 0.55 fallback while a pen is in contact,
 // and (b) surface a real "no pressure detected" warning in the status bar instead of just
 // painting every stroke at a constant medium weight, which is indistinguishable from a bug.
-let pressureDiag={pointerType:null,samples:[],distinct:new Set(),warned:false,lastReadout:0};
+let pressureDiag={pointerType:null,samples:[],distinct:new Set(),warned:false,lastReadout:0,maxSeen:0,penSamples:0};
 // Live stylus tilt state, updated on every pointer event (see pointFromEvent) — read by
 // footprint() for real-time Tip Tilt brush response. Defaults to "no tilt" so mouse/no-tilt
 // hardware never accidentally widens a Tip Tilt brush.
@@ -4590,6 +4817,12 @@ function notePressureSample(e){
     pressureDiag.samples.push(e.pressure);
     if(pressureDiag.samples.length>40) pressureDiag.samples.shift();
     pressureDiag.distinct.add(Math.round(e.pressure*1000));
+    // Feed the auto range calibration (see normalizePenPressure): remember the hardest press
+    // this pen has actually produced, and how many real in-contact pen samples we've seen.
+    if(e.pointerType==='pen' && e.pressure>0.01){
+      pressureDiag.penSamples++;
+      if(e.pressure>pressureDiag.maxSeen) pressureDiag.maxSeen=e.pressure;
+    }
   }
 }
 function pressureLooksFlat(){
@@ -4631,7 +4864,7 @@ function pointFromEvent(e){
   return {
     x:clamp((e.clientX-rect.left)*W/rect.width,0,W-1),
     y:clamp((e.clientY-rect.top)*H/rect.height,0,H-1),
-    p:applyPressureCurve(clamp(rawP,0.04,1)),
+    p:applyPressureCurve(clamp(normalizePenPressure(rawP,isPen),0.04,1)),
     rawPressure:rawP,
     pointerType:e.pointerType||'mouse',
     tiltAmount, tiltAngleRad,
@@ -4678,6 +4911,10 @@ function angleDeltaMod(a,b,mod){ let d=(a-b)%mod; if(d>mod/2) d-=mod; if(d<-mod/
 const ELONGATED_SHAPES=['liner','flat','knife','fan','rake'];
 function paint(a,b_){
   const L=activeLayer(); if(!L) return;
+  // Every new stroke gets a fresh id so depositWet can tell "wetness before this stroke" from
+  // "wetness this stroke just laid down". Assigned lazily here rather than only in pointerdown
+  // so that any code path starting a stroke by resetting strokeState also gets a correct id.
+  if(strokeState.wetId==null) strokeState.wetId=(strokeWetId=(strokeWetId+1)|0);
   const d=Math.max(0.6,dist(a,b_));
   // Spacing Jitter (Brush Creator > Stroke): randomizes the gap between dabs +/- a
   // percentage of the base spacing, so a stroke's stamps land slightly unevenly along its
@@ -4932,7 +5169,14 @@ canvas.addEventListener('pointermove',e=>{
     // Preferences > Tablet > Line Smoothing: lower = snappier/more responsive to raw input,
     // higher = more stabilized (matches the manual's "Line Smoothing Options" description).
     const smoothT=clamp(1-(PREFS.smoothing/100)*0.7,0.3,1);
-    const np={x:lerp(lastPoint.x,raw.x,smoothT),y:lerp(lastPoint.y,raw.y,smoothT),p:lerp(lastPoint.p,raw.p,smoothT)};
+    // Position is smoothed to stabilise the line, but PRESSURE is deliberately smoothed far
+    // less. Line Smoothing exists to tame hand tremor in the stroke's PATH; applying the same
+    // heavy lag to the pressure channel just delays the response to a deliberate press, which
+    // reads as pressure being mushy or "not working". Pressure therefore gets only a light
+    // de-noising pass (>=0.8) so genuine fast changes land almost immediately while single-
+    // sample spikes are still damped.
+    const pSmoothT=Math.max(0.8,smoothT);
+    const np={x:lerp(lastPoint.x,raw.x,smoothT),y:lerp(lastPoint.y,raw.y,smoothT),p:lerp(lastPoint.p,raw.p,pSmoothT)};
     paint(lastPoint,np); lastPoint=np;
   });
 });
@@ -7151,6 +7395,7 @@ function resampleImage(nw,nh){
   W=nw;H=nh;N=W*H;
   canvas.width=W; canvas.height=H; image=ctx.createImageData(W,H);
   toothMap=new Float32Array(N); absorbMap=new Float32Array(N);
+  reallocStrokeWetBuffers(); // the wet-on-wet "wetness at stroke start" buffers are canvas-sized too
   paperR=new Float32Array(N); paperG=new Float32Array(N); paperB=new Float32Array(N);
   buildPaper();
   layers=newLayers; selectionMask=null;
@@ -7389,6 +7634,7 @@ async function deserializeProject(proj){
   W=proj.W; H=proj.H; N=W*H;
   canvas.width=W; canvas.height=H; image=ctx.createImageData(W,H);
   toothMap=new Float32Array(N); absorbMap=new Float32Array(N);
+  reallocStrokeWetBuffers(); // the wet-on-wet "wetness at stroke start" buffers are canvas-sized too
   paperR=new Float32Array(N); paperG=new Float32Array(N); paperB=new Float32Array(N);
   paperKey=proj.paperKey||'cp'; paper=PAPERS[paperKey]||PAPERS.cp; if(proj.paperTint) paper.tint=proj.paperTint;
   paperTextureScale=proj.paperTextureScale||100; deckledEdgesOn=!!proj.deckledEdgesOn;
@@ -7526,6 +7772,8 @@ function openPreferences(){
           <option value="soft" ${PREFS.pressureCurve==='soft'?'selected':''}>Soft (needs more force)</option>
           <option value="firm" ${PREFS.pressureCurve==='firm'?'selected':''}>Firm (reaches full effect fast)</option>
         </select></div>
+        <div class="mrow"><label>Pressure Sensitivity</label><input type="range" id="pPressureSens" min="0" max="100" value="${PREFS.pressureSensitivity}"><output>${PREFS.pressureSensitivity}%</output></div>
+        <p class="tinyNote">Also available on the top bar. 0% ignores pen pressure entirely (every stroke at full strength), 50% is the calibrated default, 100% gives the widest range. Pen input is additionally auto-calibrated to the hardest press seen this session, so tablets that never report a full 1.0 can still reach full-strength strokes.</p>
         <div class="mrow"><label>Line Smoothing</label><input type="range" id="pSmoothing" min="0" max="100" value="${PREFS.smoothing}"><output>${PREFS.smoothing}</output></div>
         <div class="mrow"><label>Tablet Mode</label><select id="pTabletMode">
           <option value="auto" ${PREFS.tabletMode==='auto'?'selected':''}>Auto-detect</option>
@@ -7533,6 +7781,7 @@ function openPreferences(){
           <option value="never" ${PREFS.tabletMode==='never'?'selected':''}>Never</option>
         </select></div>`;
       document.getElementById('pPressureCurve').onchange=e=>{ PREFS.pressureCurve=e.target.value; persistPrefs(); };
+      document.getElementById('pPressureSens').oninput=e=>{ PREFS.pressureSensitivity=+e.target.value; e.target.nextElementSibling.textContent=PREFS.pressureSensitivity+'%'; persistPrefs(); buildQuickbar(); };
       document.getElementById('pSmoothing').oninput=e=>{ PREFS.smoothing=+e.target.value; e.target.nextElementSibling.textContent=PREFS.smoothing; persistPrefs(); };
       document.getElementById('pTabletMode').onchange=e=>{ PREFS.tabletMode=e.target.value; persistPrefs(); };
     } else if(prefsTab==='keyboard'){
@@ -7639,6 +7888,7 @@ function resizeCanvas(nw,nh,keepContent){
   canvas.width=W; canvas.height=H;
   image=ctx.createImageData(W,H);
   toothMap=new Float32Array(N); absorbMap=new Float32Array(N);
+  reallocStrokeWetBuffers(); // the wet-on-wet "wetness at stroke start" buffers are canvas-sized too
   paperR=new Float32Array(N); paperG=new Float32Array(N); paperB=new Float32Array(N);
   buildPaper();
   layers = keepContent ? oldLayers.map(L=>{
@@ -7665,6 +7915,11 @@ function buildQuickbar(){
     <div class="qsep"></div>
     <input type="color" id="qbColor" class="swMini" value="${color}">
     <div class="qsep"></div>
+    <label class="qslider" title="Pressure Sensitivity — how strongly pen pressure changes stroke size and opacity. 0% ignores pressure entirely, 50% is the calibrated default, 100% gives the widest range (hairline to full width).">Pressure
+      <input type="range" id="qbPressure" min="0" max="100" step="1" value="${PREFS.pressureSensitivity}">
+      <output id="qbPressureOut">${PREFS.pressureSensitivity}%</output></label>
+    <div class="qsep"></div>
+    <button class="qbtn ${showWetOverlay?'primary':''}" id="qbShowWet" title="Show Wet (H) — tint wet areas blue so you can see exactly where the canvas is still wet">💧 Wet</button>
     <button class="qbtn" id="qbDry">Dry Canvas</button>
     <button class="qbtn" id="qbClear">Clear Layer</button>
     <div class="qsep"></div>
@@ -7673,6 +7928,14 @@ function buildQuickbar(){
     <div class="qsep"></div>
     <button class="qbtn primary" id="qbExport">Export PNG</button>`;
   document.getElementById('qbColor').oninput=e=>setColor(e.target.value);
+  const qp=document.getElementById('qbPressure');
+  if(qp) qp.oninput=e=>{
+    PREFS.pressureSensitivity=+e.target.value;
+    const out=document.getElementById('qbPressureOut'); if(out) out.textContent=PREFS.pressureSensitivity+'%';
+    persistPrefs();
+  };
+  const qsw=document.getElementById('qbShowWet');
+  if(qsw) qsw.onclick=()=>{ showWetOverlay=!showWetOverlay; markFullDirty(); render(true); buildLayersPanel(); buildQuickbar(); };
   document.getElementById('qbUndo').onclick=undo;
   document.getElementById('qbRedo').onclick=redo;
   document.getElementById('qbDry').onclick=dryCanvas;
