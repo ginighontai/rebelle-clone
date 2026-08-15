@@ -43,18 +43,36 @@ select{background:var(--input-bg);border:1px solid var(--line);color:var(--text)
 .menuPop kbd{color:var(--text-dim);font-size:10px}
 
 /* quick bar under menu (undo/redo, zoom, export) */
-.quickbar{flex:0 0 34px;display:flex;align-items:center;gap:10px;background:#2c2f36;border-bottom:1px solid var(--panel-border);
-  padding:0 10px;overflow-x:auto;overflow-y:hidden;white-space:nowrap}
-.qbtn{background:#454b56;border:1px solid var(--line);color:var(--text);border-radius:6px;padding:5px 10px;font-size:11.5px;display:inline-flex;align-items:center;gap:5px}
+/* Top bar. Two rules matter here: (a) it must never scroll horizontally — controls kept getting
+   appended until 2135px of content sat in a 1280px bar (855px hidden behind a scrollbar), so
+   overflow is now visible and the row is allowed to WRAP as a hard guarantee that nothing is ever
+   unreachable on a narrow window; (b) it is packed tightly — icon-only buttons with tooltips,
+   short sliders, no redundant text labels — so at normal widths it still fits on one line. */
+.quickbar{flex:0 0 auto;min-height:32px;display:flex;flex-wrap:wrap;align-items:center;gap:4px;
+  background:#2c2f36;border-bottom:1px solid var(--panel-border);padding:3px 6px;overflow:visible}
+.qbtn{background:#454b56;border:1px solid var(--line);color:var(--text);border-radius:5px;padding:4px 8px;font-size:11px;display:inline-flex;align-items:center;gap:4px;line-height:1.15}
+/* Icon-only variant: fixed square-ish footprint, label carried by the tooltip instead.
+   Icons are inline SVG, NOT emoji/unicode glyphs. A first attempt used characters like the
+   droplet, palette, sun and arrows; on a system without an emoji/symbol font every one of them
+   rendered as an empty tofu box, which made icon-only buttons completely unidentifiable — far
+   worse than the overflow being fixed. SVG strokes always render, scale crisply, and inherit
+   currentColor so the active state works. */
+.qbtn.ico{padding:4px 0;min-width:27px;justify-content:center}
+.qbtn.ico.on{background:var(--accent2);border-color:var(--accent2);color:#08131c}
+.qbtn svg{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;display:block}
+.qslider .glyph svg{width:13px;height:13px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;display:block}
 .qbtn:hover{background:#525a67}
 .qbtn.primary{background:var(--accent2);border-color:var(--accent2);color:#0b1720;font-weight:700}
 .qbtn.primary:hover{background:var(--accent)}
 .qbtn:disabled{opacity:.4;cursor:default;pointer-events:none}
 .qsep{width:1px;height:18px;background:var(--line)}
 /* inline labelled slider for the quickbar (Pressure Sensitivity) */
-.qslider{display:inline-flex;align-items:center;gap:6px;color:#c3cbd9;font-size:11px;flex:0 0 auto}
-.qslider input[type=range]{width:96px}
-.qslider output{width:34px;text-align:right;color:#fff;font-variant-numeric:tabular-nums}
+.qslider{display:inline-flex;align-items:center;gap:3px;color:#c3cbd9;font-size:10.5px;flex:0 0 auto}
+.qslider input[type=range]{width:58px;margin:0}
+.qslider output{width:27px;text-align:right;color:#fff;font-variant-numeric:tabular-nums;font-size:10.5px}
+.qslider .glyph{font-size:12px;opacity:.85}
+.quickbar select{font-size:11px;padding:2px 3px;max-width:132px}
+#qbSymMode{max-width:82px}
 .toolName{color:var(--accent);font-weight:700;font-size:11.5px}
 .swMini{width:20px;height:20px;border-radius:4px;border:1px solid #000;padding:0;vertical-align:middle}
 
@@ -5786,8 +5804,8 @@ function buildPropertiesPanel(){
     // oils — it was previously hidden (and inert) for watercolour/ink/airbrush.
     if(!isOily && TOOL_BIAS[brush.engine] && TOOL_BIAS[brush.engine].waterMul>0){
       html+=srow('Loading','brush.loading',0,100,1);
-      html+=srowSel('Pressure \u2192 Water','brush.waterBehavior',[['constant','Constant'],['pressure','Pressure (harder = wetter)'],['pressure-soft','Pressure (soft)'],['velocity','Velocity']]);
-      html+=`<p class="tinyNote">Loading is how much pigment the brush pushes into the surface water — raise it for saturated wet-on-wet blends, drop it below ~45 and the brush becomes a damp blender that lifts and redistributes paint already on the canvas. Pressure &rarr; Water on "Pressure" makes a light touch lay concentrated pigment and a hard press flood the area with water.</p>`;
+      html+=srowSel('Water by Pressure','brush.waterBehavior',[['constant','Constant'],['pressure','Pressure (harder = wetter)'],['pressure-soft','Pressure (soft)'],['velocity','Velocity']]);
+      html+=`<p class="tinyNote">Loading is how much pigment the brush pushes into the surface water — raise it for saturated wet-on-wet blends, drop it below ~45 and the brush becomes a damp blender that lifts and redistributes paint already on the canvas. Setting Water by Pressure to "Pressure" makes a light touch lay concentrated pigment and a hard press flood the area with water.</p>`;
     }
     if(isOily) html+=srow('Oiliness','brush.oiliness',0,100,1); else html+=srow('Water','brush.water',0,1,0.01);
     if(hasLength) html+=srow('Length','brush.length',1,100,1);
@@ -8142,44 +8160,61 @@ function resizeCanvas(nw,nh,keepContent){
 
 /* ---- Quickbar ---- */
 function buildQuickbar(){
+  const tiltLive=canvasTilt.enabled&&canvasTilt.strength>0.001;
+  const QI={
+    undo:svg('<path d="M9 7L4 12l5 5"/><path d="M4 12h11a5 5 0 0 1 0 10h-1"/>'),
+    redo:svg('<path d="M15 7l5 5-5 5"/><path d="M20 12H9a5 5 0 0 0 0 10h1"/>'),
+    pen:svg('<path d="M3 21l1.5-5L15 5.5 18.5 9 8 19.5z"/><path d="M13 7.5l3.5 3.5"/>'),
+    sym:svg('<path d="M12 3v18"/><path d="M8 8L4 12l4 4"/><path d="M16 8l4 4-4 4"/>'),
+    tilt:svg('<path d="M4 4l16 16"/><path d="M20 13v7h-7"/>'),
+    down:svg('<path d="M12 5v12"/><path d="M7 12l5 5 5-5"/>'),
+    angle:svg('<path d="M4 20h16"/><path d="M4 20L17 7"/>'),
+    drop:svg('<path d="M12 3c4 5 6 8 6 12a6 6 0 0 1-12 0c0-4 2-7 6-12z"/>'),
+    palette:svg('<circle cx="12" cy="12" r="8.5"/><circle cx="9" cy="9.5" r="1.1" fill="currentColor" stroke="none"/><circle cx="14.5" cy="9" r="1.1" fill="currentColor" stroke="none"/><circle cx="15" cy="14.5" r="1.1" fill="currentColor" stroke="none"/><circle cx="9.5" cy="15" r="1.1" fill="currentColor" stroke="none"/>'),
+    soak:svg('<path d="M12 2c3 4 4.5 6.5 4.5 9a4.5 4.5 0 0 1-9 0C7.5 8.5 9 6 12 2z"/><path d="M4 20h16"/>'),
+    sun:svg('<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5.2 5.2l1.4 1.4M17.4 17.4l1.4 1.4M18.8 5.2l-1.4 1.4M6.6 17.4l-1.4 1.4"/>'),
+    trash:svg('<path d="M4 7h16"/><path d="M7 7l1 13h8l1-13"/><path d="M10 11v6M14 11v6"/><path d="M9 7V4h6v3"/>'),
+    brush:svg('<path d="M7 20l2-6 8-9 3 3-9 8z"/><path d="M9 14l3 3"/>'),
+    doc:svg('<path d="M6 3h8l4 4v14H6z"/><path d="M14 3v4h4"/>'),
+    dl:svg('<path d="M12 4v11"/><path d="M8 11l4 4 4-4"/><path d="M5 20h14"/>'),
+  };
   document.getElementById('quickbar').innerHTML=`
-    <button class="qbtn" id="qbUndo" title="Undo (Ctrl+Z)">↶ Undo</button>
-    <button class="qbtn" id="qbRedo" title="Redo (Ctrl+Shift+Z)">↷ Redo</button>
+    <button class="qbtn ico" id="qbUndo" title="Undo (Ctrl+Z)">${QI.undo}</button>
+    <button class="qbtn ico" id="qbRedo" title="Redo (Ctrl+Shift+Z)">${QI.redo}</button>
     <div class="qsep"></div>
-    <span class="toolName" id="qbToolName">Watercolor</span>
-    <div class="qsep"></div>
-    <input type="color" id="qbColor" class="swMini" value="${color}">
-    <div class="qsep"></div>
-    <label class="qslider" title="Pressure Sensitivity — how strongly pen pressure changes stroke size and opacity. 0% ignores pressure entirely, 50% is the calibrated default, 100% gives the widest range (hairline to full width).">Pressure
+    <input type="color" id="qbColor" class="swMini" value="${color}" title="Paint colour">
+    <label class="qslider" title="Pressure Sensitivity — how strongly pen pressure changes stroke size and opacity. 0% ignores pressure entirely, 50% is the calibrated default, 100% gives the widest range (hairline to full width).">
+      <span class="glyph">${QI.pen}</span>
       <input type="range" id="qbPressure" min="0" max="100" step="1" value="${PREFS.pressureSensitivity}">
       <output id="qbPressureOut">${PREFS.pressureSensitivity}%</output></label>
     <div class="qsep"></div>
-    <label class="qslider" title="Canvas paper / surface — changes the paper texture, tooth and absorbency the whole simulation reads from">Paper
-      <select id="qbPaper">${Object.entries(PAPERS).map(([k,p])=>`<option value="${k}" ${k===paperKey?'selected':''}>${p.name}</option>`).join('')}</select></label>
+    <select id="qbPaper" title="Canvas paper / surface — changes the paper texture, tooth and absorbency the whole simulation reads from">${Object.entries(PAPERS).map(([k,p])=>`<option value="${k}" ${k===paperKey?'selected':''}>${p.name}</option>`).join('')}</select>
     <div class="qsep"></div>
-    <button class="qbtn ${symmetry.enabled?'primary':''}" id="qbSym" title="Symmetry — mirror every stroke across the canvas. Choose the mode with the dropdown beside it.">⇋ Symmetry</button>
+    <button class="qbtn ico ${symmetry.enabled?'on':''}" id="qbSym" title="Symmetry — mirror every stroke across the canvas (mode in the dropdown beside)">${QI.sym}</button>
     <select id="qbSymMode" title="Symmetry mode">
       ${[['vertical','Vertical'],['horizontal','Horizontal'],['both','Both'],['radial','Radial']].map(([v,l])=>`<option value="${v}" ${symmetry.mode===v?'selected':''}>${l}</option>`).join('')}
     </select>
     <div class="qsep"></div>
-    <button class="qbtn ${(canvasTilt.enabled&&canvasTilt.strength>0.001)?'primary':''}" id="qbTilt" title="Canvas Tilt (Alt+T) — gravity pulls wet pigment and water downhill into runs, pooling and drips">⤡ Tilt</button>
-    <label class="qslider" title="Tilt force — gentle slope near 0, steep rapid runoff near 100">Force
+    <button class="qbtn ico ${tiltLive?'on':''}" id="qbTilt" title="Canvas Tilt (Alt+T) — gravity pulls wet pigment and water downhill into runs, pooling and drips">${QI.tilt}</button>
+    ${tiltLive?`<label class="qslider" title="Tilt force — gentle slope near 0, steep rapid runoff near 100">
+      <span class="glyph">${QI.down}</span>
       <input type="range" id="qbTiltForce" min="0" max="100" step="1" value="${Math.round(canvasTilt.strength*100)}">
       <output id="qbTiltForceOut">${Math.round(canvasTilt.strength*100)}%</output></label>
-    <label class="qslider" title="Tilt direction in degrees — which way is downhill">Angle
+    <label class="qslider" title="Tilt direction in degrees — which way is downhill">
+      <span class="glyph">${QI.angle}</span>
       <input type="range" id="qbTiltAngle" min="-180" max="180" step="1" value="${Math.round(canvasTilt.angle)}">
-      <output id="qbTiltAngleOut">${Math.round(canvasTilt.angle)}°</output></label>
+      <output id="qbTiltAngleOut">${Math.round(canvasTilt.angle)}&deg;</output></label>`:''}
     <div class="qsep"></div>
-    <button class="qbtn ${showWetOverlay?'primary':''}" id="qbShowWet" title="Show Wet (H) — tint wet areas blue so you can see exactly where the canvas is still wet">💧 Wet</button>
-    <button class="qbtn ${naturalColors?'primary':''}" id="qbPigments" title="Pigments mixing mode — mix in Kubelka-Munk subtractive space so blue+yellow makes green instead of grey. Essential for vivid wet-on-wet blends.">🎨 Pigments</button>
-    <button class="qbtn" id="qbWetLayer" title="Wet the Whole Layer (Shift+L) — soak the canvas so the next strokes bleed and blend">💧 Wet Layer</button>
-    <button class="qbtn" id="qbDry">Dry Canvas</button>
-    <button class="qbtn" id="qbClear">Clear Layer</button>
+    <button class="qbtn ico ${showWetOverlay?'on':''}" id="qbShowWet" title="Show Wet (H) — tint wet areas blue so you can see exactly where the canvas is still wet">${QI.drop}</button>
+    <button class="qbtn ico ${naturalColors?'on':''}" id="qbPigments" title="Pigments mixing mode — mix in Kubelka-Munk subtractive space so blue+yellow makes green instead of grey. Essential for vivid wet-on-wet blends.">${QI.palette}</button>
+    <button class="qbtn ico" id="qbWetLayer" title="Wet the Whole Layer (Shift+L) — soak the canvas so the next strokes bleed and blend">${QI.soak}</button>
+    <button class="qbtn ico" id="qbDry" title="Dry Canvas — remove all water so paint locks in place">${QI.sun}</button>
+    <button class="qbtn ico" id="qbClear" title="Clear Layer — erase everything on the active layer">${QI.trash}</button>
     <div class="qsep"></div>
-    <label class="qbtn fileBtn" style="padding:5px 10px" title="Import a brush preset: Rebelle .json/.png, or Photoshop .abr">Import Brush…<input type="file" accept=".json,application/json,.png,image/png,.abr" id="qbImportBrush"></label>
-    <label class="qbtn fileBtn" style="padding:5px 10px" title="Import a custom paper/canvas texture (.png/.jpg)">Import Paper…<input type="file" accept="image/*" id="qbImportPaper"></label>
+    <label class="qbtn ico fileBtn" title="Import a brush preset: Rebelle .json/.png, or Photoshop .abr">${QI.brush}<input type="file" accept=".json,application/json,.png,image/png,.abr" id="qbImportBrush"></label>
+    <label class="qbtn ico fileBtn" title="Import a custom paper/canvas texture (.png/.jpg)">${QI.doc}<input type="file" accept="image/*" id="qbImportPaper"></label>
     <div class="qsep"></div>
-    <button class="qbtn primary" id="qbExport">Export PNG</button>`;
+    <button class="qbtn primary" id="qbExport" title="Export the canvas as a PNG image">${QI.dl} PNG</button>`;
   document.getElementById('qbColor').oninput=e=>setColor(e.target.value);
   const qp=document.getElementById('qbPressure');
   if(qp) qp.oninput=e=>{
