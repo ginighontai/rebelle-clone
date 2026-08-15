@@ -4479,14 +4479,9 @@ function diffuseWetBands(L,diffF,edgeF,tiltOn,gDirX,gDirY,gStrength,granStr){
         // the watery fraction racing ahead and leaving the dense pigment behind.
         let gw=1;
         if(tiltOn){
-          // Bulk downhill bias is deliberately GENTLE. It used to reach ~3.6x, applied to every
-          // wet pixel, which made the entire wash march downward as one smeared mass and
-          // completely swamped the drips — a tilted stroke just slid instead of shedding runs.
-          // Real tilted watercolour mostly holds its shape and sheds thin fingers from its lower
-          // edge, so the body now creeps only slightly and the rivulets do the visible work.
           const align=DX[k]*gDirX+DY[k]*gDirY;
           const dilution=w/(w+d*0.8+0.001); // ~1 = nearly pure water, ->0 = thick pigment paste
-          gw=1+Math.max(0,align)*gStrength*0.85*(0.45+dilution*1.1);
+          gw=1+Math.max(0,align)*gStrength*2.6*(0.45+dilution*1.1);
         }
         // Paper heightmap bias: the brush engine reads the paper's tooth, and water/pigment run
         // OFF the raised peaks and POOL in the valleys. That is the physical origin of
@@ -4608,151 +4603,126 @@ function simulateLayer(L){
    as it uses up the puddle feeding it, and only new ones spawn from genuinely overloaded
    (very wet + pigment-bearing) puddle pixels — capped in count so they read as a few real
    drips, not a burst of noise. */
-/* Lay a disc of paint. Shared by the trail, the terminal bead and satellite droplets so the
-   pigment-mixing logic exists once. `wetCap` controls how wet this makes the paper, and it is the
-   single most important parameter for drip appearance: a trail laid down WET immediately blooms
-   and dissolves (measured previously: runs travelled their full length yet left nothing visible),
-   whereas a nearly-dry trail survives as the crisp, saturated line real drips leave behind. */
-function dripDeposit(L,cx,cy,rad,amount,pr,pg,pb,wetCap){
-  if(amount<=0.0003) return;
-  const km=(naturalColors||!!L.useColorPigments);
-  const r0=Math.max(0.6,rad), ri=Math.ceil(r0);
-  for(let oy=-ri;oy<=ri;oy++){
-    for(let ox=-ri;ox<=ri;ox++){
-      const dist=Math.hypot(ox,oy); if(dist>r0) continue;
-      const xx=cx+ox, yy=cy+oy;
-      if(xx<0||yy<0||xx>=W||yy>=H) continue;
-      if(!diffusionAllowed(L,xx,yy)) continue;
-      const fall=1-dist/(r0+0.001);
-      const jj=yy*W+xx;
-      const dep=amount*fall;
-      if(dep>0.0004){
-        const od=L.pd[jj], tot=od+dep+1e-6;
-        // A run crossing another colour mixes with it mid-flow, subtractively when Pigments is on.
-        if(km && od>0.01){
-          const mx=mixKM(L.pr[jj],L.pg[jj],L.pb[jj],pr,pg,pb,clamp(dep/tot,0,1));
-          L.pr[jj]=mx.r; L.pg[jj]=mx.g; L.pb[jj]=mx.b;
-        } else {
-          L.pr[jj]=(L.pr[jj]*od+pr*dep)/tot; L.pg[jj]=(L.pg[jj]*od+pg*dep)/tot; L.pb[jj]=(L.pb[jj]*od+pb*dep)/tot;
-        }
-        L.pd[jj]=clamp(tot,0,2.4);
-      }
-      if(wetCap>0) L.wet[jj]=clamp(Math.max(L.wet[jj],wetCap*fall),0,1.6);
-      growBounds(L,xx,yy);
-    }
-  }
-}
-/* ---- Gravity drips (Canvas Tilt) ----
-   Modelled on how a real run behaves, matching the reference drip plates: a BEAD of paint breaks
-   off the lower edge of a wet mass, travels under gravity leaving a long thin tail of roughly even
-   width behind it, and finally pins and dumps its remaining volume as a bulb at the tip. The head
-   it came from stays put.
-   This replaces an earlier model that tapered a wide, wet trail to nothing. Three things were
-   wrong with it and all three are fixed here:
-     - it wet its own trail heavily, so the tail bloomed and dissolved into the surrounding wet
-       field within about a second (runs measured full length but were invisible);
-     - it tapered instead of accumulating, so there was never a terminal bead;
-     - the spawn test demanded that the pixel directly downhill already be 25% drier, which is
-       almost never true while bulk gravity is dragging the whole wash downward — audited at 26,400
-       candidates, that single test rejected 98.7% of them, so drips essentially never formed. */
-const DRIP_TRAIL_WET=0.20; // trails stay nearly dry on purpose (see dripDeposit)
 function updateRivulets(L,tiltOn,gDirX,gDirY,gStrength){
   if(!L.rivulets) L.rivulets=[];
-  const had=L.rivulets.length>0;
-  // Few, substantial runs — not many wispy ones. An earlier cap of 5+12*force put roughly five
-  // separate threads under every blob, which read as hair rather than paint. Real drip plates show
-  // one or two confident runs per mass.
-  const maxActive=tiltOn?(2+Math.round(gStrength*4)):2;
-  const stepLen=1.4+gStrength*1.0; // steeper canvas -> faster run
-  for(let ri=L.rivulets.length-1;ri>=0;ri--){
+  // A steeply tilted canvas should shed MANY runs at once, not the same handful it sheds when
+  // flat. Instrumentation showed only 7 rivulets over 400 frames at full tilt, which is far too
+  // few to read as "gravity pulling the wash downward" — the cap, not the physics, was the limit.
+  const maxActive=tiltOn?(6+Math.round(gStrength*18)):6;
+  const hadRivuletsBefore=L.rivulets.length>0;
+  // Advance existing rivulets.
+  for(let ri=L.rivulets.length-1; ri>=0; ri--){
     const r=L.rivulets[ri];
-    r.life--;
-    // Slight organic wobble so a run isn't a ruler-straight line.
-    const wob=(noise(r.x*0.14,r.seed+r.steps*0.07)-0.5)*0.5;
-    let dx=r.dirx+wob*0.30, dy=r.diry+(tiltOn?0:0.02);
+    const i=Math.round(r.y)*W+Math.round(r.x);
+    const feed = (i>=0&&i<N) ? L.wet[i] : 0;
+    /* BUG: this used to terminate the rivulet whenever the pixel it currently sits on was drier
+       than 0.25 — i.e. the instant it left the puddle and reached dry paper, which is on its very
+       first step downhill. So a drip could never actually travel anywhere: it was destroyed
+       exactly when it started to become a drip. That is why tilting the canvas produced no
+       visible runs even with gravity working correctly underneath.
+       A real drip carries its own bead of liquid down dry paper and dies when that bead is spent.
+       So the carried volume (r.wet) is now what sustains it, and the surface it crosses only
+       REPLENISHES it when that surface happens to be wet (running back through a puddle tops the
+       drip up and lets it continue further, which is also what real runs do). */
+    if(r.wet<0.10 || r.life<=0){ L.rivulets.splice(ri,1); continue; }
+    if(feed>0.3) r.wet=Math.min(1.6,r.wet+feed*0.05); // crossing wet ground feeds the run
+    r.life-=1;
+    // Slight organic wobble so the stream isn't a perfectly straight line.
+    const wob=(noise(r.x*0.15,r.seed+r.steps*0.08)-0.5)*0.6;
+    const dx=r.dirx+wob*0.35, dy=r.diry+ (tiltOn?0:0.02);
     const len=Math.hypot(dx,dy)||1;
-    const px0=r.x, py0=r.y;
-    r.x+=dx/len*stepLen; r.y+=dy/len*stepLen; r.steps++;
+    r.x+=dx/len*1.6; r.y+=dy/len*1.6; r.steps++;
+    if(r.x<1||r.y<1||r.x>=W-1||r.y>=H-1 || !diffusionAllowed(L,Math.round(r.x),Math.round(r.y))){ L.rivulets.splice(ri,1); continue; }
     const cx=Math.round(r.x), cy=Math.round(r.y);
-    const gone=(r.x<1||r.y<1||r.x>=W-1||r.y>=H-1||!diffusionAllowed(L,cx,cy));
-    if(!gone){
-      /* Deposit along the whole SEGMENT just travelled, not only at the landing point. A run moves
-         up to ~2.4px per frame while its tail is only ~3px across, so stamping one disc per frame
-         left visible gaps and the tails rendered as dashed threads rather than continuous lines.
-         Sub-stepping at less than one radius guarantees the discs overlap at any tilt speed. */
-      /* Neck: a run tears away from the mass WIDE and narrows into its tail over the first stretch,
-         which is what gives real drips their teardrop/mushroom profile. Without it the result is a
-         lollipop — an abrupt circular head with a constant-width thread starting at its edge. */
-      const neck = r.steps<18 ? lerp(3.1,1.0,r.steps/18) : 1.0;
-      const wNow = r.width*neck;
-      const segLen=Math.hypot(r.x-px0,r.y-py0);
-      const sub=Math.max(1,Math.ceil(segLen/Math.max(0.7,wNow*0.6)));
-      for(let s=1;s<=sub;s++){
-        const t=s/sub;
-        dripDeposit(L,Math.round(px0+(r.x-px0)*t),Math.round(py0+(r.y-py0)*t),
-                    wNow,r.trailAmt*0.8,r.pr,r.pg,r.pb,DRIP_TRAIL_WET);
-      }
-      // Occasional detached satellite droplet flung to the side, as in the reference plates.
-      if(Math.random()<0.014){
-        const px=-dy/len, py=dx/len;
-        const off=(Math.random()<0.5?-1:1)*(2.5+Math.random()*4.5);
-        dripDeposit(L,Math.round(cx+px*off),Math.round(cy+py*off),0.7+Math.random()*0.9,
-                    r.trailAmt*0.8,r.pr,r.pg,r.pb,DRIP_TRAIL_WET*0.5);
+    const rad=Math.max(1,r.width);
+    for(let oy=-rad;oy<=rad;oy++){
+      for(let ox=-rad;ox<=rad;ox++){
+        const dist=Math.hypot(ox,oy); if(dist>rad) continue;
+        const xx=cx+ox, yy=cy+oy; if(xx<0||yy<0||xx>=W||yy>=H) continue;
+        if(!diffusionAllowed(L,xx,yy)) continue;
+        const fall=1-dist/(rad+0.001);
+        const jj=yy*W+xx;
+        // Wet the trail, but less than the bead itself carries: at full strength the trail was
+        // wet enough that its own pigment immediately diffused away again, so runs measured the
+        // right LENGTH while being almost invisible.
+        L.wet[jj]=clamp(Math.max(L.wet[jj],r.wet*fall*0.7),0,1.6);
+        // Raised from 0.35: measured trails were laying down only ~0.13 density, which the
+        // surrounding wet diffusion then spread below the visibility threshold within a second,
+        // so the runs travelled their full length but left almost nothing behind to see.
+        const dep=r.pigment*fall*0.95;
+        if(dep>0.0005){
+          const od=L.pd[jj], tot=od+dep+1e-6;
+          // WET BLENDING IN MOTION: a running drip crossing another colour's stream mixes with
+          // it mid-flow. With Pigments on that secondary mixture is computed subtractively, so
+          // two streams crossing produce a real pigment mix rather than an RGB average that
+          // greys out — this path was a plain weighted average regardless of mixing mode.
+          if((naturalColors||L.useColorPigments) && od>0.01){
+            const t=clamp(dep/tot,0,1);
+            const mx=mixKM(L.pr[jj],L.pg[jj],L.pb[jj],r.pr,r.pg,r.pb,t);
+            L.pr[jj]=mx.r; L.pg[jj]=mx.g; L.pb[jj]=mx.b;
+          } else {
+            L.pr[jj]=(L.pr[jj]*od+r.pr*dep)/tot; L.pg[jj]=(L.pg[jj]*od+r.pg*dep)/tot; L.pb[jj]=(L.pb[jj]*od+r.pb*dep)/tot;
+          }
+          L.pd[jj]=clamp(tot,0,2.4);
+        }
+        growBounds(L,xx,yy);
       }
     }
-    if(gone||r.life<=0){
-      // Terminal bead: the run pins and its remaining volume pools into a bulb at the tip.
-      if(!gone) dripDeposit(L,cx,cy,r.beadRad,r.beadAmt,r.pr,r.pg,r.pb,DRIP_TRAIL_WET*1.5);
-      L.rivulets.splice(ri,1); continue;
-    }
+    // Taper: the run consumes the puddle it passes over and steadily spends its own bead, so it
+    // thins and fades out rather than travelling forever. Spend rate scales inversely with tilt
+    // force — a steep canvas drives a drip further before it exhausts itself.
+    L.wet[i]=Math.max(0,feed-0.02);
+    const spend=lerp(0.994,0.9975,clamp(gStrength,0,1));
+    r.wet*=spend; r.pigment*=0.998; r.width=Math.max(0.6,r.width*0.997);
   }
-  if(L.rivulets.length>=maxActive || !L.wetBounds) return had||L.rivulets.length>0;
+  // Spawn new rivulets from overloaded puddle pixels (only when tilt/drip conditions call
+  // for it), capped so at most a few run at once.
+  if(L.rivulets.length>=maxActive || !L.wetBounds) return hadRivuletsBefore||L.rivulets.length>0;
   const b=L.wetBounds, bw=b.maxx-b.minx+1, bh=b.maxy-b.miny+1;
-  const scanTries=Math.min(tiltOn?1600:400,bw*bh);
+  // With tilt on, spawning is restricted to the fluid's downhill EDGE (see the surface-tension
+  // test below), which is a thin sliver of the wet region — a uniform random scan of only 400
+  // points across the whole bounding box almost never lands on it. More tries when tilted, so
+  // edges are actually found and runs form at a believable rate.
+  const scanTries=Math.min(tiltOn?2200:400,bw*bh);
   const dripChance=0.02*V.dripSize*(tiltOn?(1+gStrength*2):0.4);
-  const wetThresh=tiltOn?clamp(0.55-gStrength*0.22,0.18,0.9):1.3;
+  /* SURFACE TENSION BREAKS.
+     Drips do not appear in the middle of a puddle — they form where gravity drags pooled liquid
+     past the point its surface tension can hold, i.e. at the pool's DOWNHILL EDGE, and then a
+     finger breaks away and runs. Two problems previously:
+       - the wetness threshold was 1.15 - strength*0.35, i.e. ~0.92 even at full force. Wetness
+         that high only exists for a moment right under the Water tool, and it drops fast once
+         diffusion spreads it, so in practice the condition almost never held and no drips ever
+         spawned. Now scales down properly with force, so a genuinely tilted wet wash drips.
+       - spawn points were picked at random anywhere in the wet region, so when drips did fire
+         they started mid-pool rather than breaking off an edge.
+     The edge test below requires the pixel to be wet AND its downhill neighbour to be
+     noticeably drier — which is exactly the fluid boundary where a bead breaks. */
+  const wetThresh=tiltOn?clamp(0.80-gStrength*0.34,0.30,1.0):1.3;
   for(let k=0;k<scanTries;k++){
-    let x=(b.minx+Math.random()*bw)|0, y=(b.miny+Math.random()*bh)|0, i=y*W+x;
-    if(L.wet[i]<=wetThresh || L.pd[i]<=0.08) continue;
-    if(Math.random()>=dripChance) continue;
+    const x=(b.minx+Math.random()*bw)|0, y=(b.miny+Math.random()*bh)|0, i=y*W+x;
+    if(L.wet[i]<=wetThresh || L.pd[i]<=0.05) continue;
     if(tiltOn){
-      // Walk downhill to the fluid's leading edge and break the bead off THERE. Walking finds the
-      // real boundary regardless of how the wash is shaped, where the old single-neighbour test
-      // could not.
-      let wx=x, wy=y;
-      for(let s=0;s<80;s++){
-        const nx=Math.round(wx+gDirX), ny=Math.round(wy+gDirY);
-        if(nx<0||ny<0||nx>=W||ny>=H) break;
-        if(L.wet[ny*W+nx]<=wetThresh*0.55) break;
-        wx=nx; wy=ny;
-      }
-      x=Math.round(wx); y=Math.round(wy); i=y*W+x;
+      // Look one step downhill: a drip only breaks away at the fluid's leading edge.
+      const dx0=Math.round(gDirX*2), dy0=Math.round(gDirY*2);
+      const nx0=x+dx0, ny0=y+dy0;
+      if(nx0<0||ny0<0||nx0>=W||ny0>=H) continue;
+      const downWet=L.wet[ny0*W+nx0];
+      if(downWet > L.wet[i]*0.75) continue; // still inside the pool, tension not broken here
     }
-    // Keep runs visually separate — distinct fingers, not one merged smear.
-    // Keep a wide exclusion zone so one wet mass sheds one or two runs, not a fringe of threads.
-    let tooClose=false;
-    for(const rr of L.rivulets){ if(Math.abs(rr.x-x)<46){ tooClose=true; break; } }
-    if(tooClose) continue;
-    const wid=1.6+Math.random()*1.2;               // radius -> ~4-6px tail, vs a much wider head
-    const src=clamp(L.pd[i],0,2.4);
+    if(Math.random()>=dripChance) continue;
+    const dirx=tiltOn?gDirX:(Math.random()-0.5)*0.3, diry=tiltOn?gDirY:1;
     L.rivulets.push({
-      x,y,
-      dirx:tiltOn?gDirX:(Math.random()-0.5)*0.3, diry:tiltOn?gDirY:1,
-      seed:Math.random()*1000, steps:0,
-      width:wid,
-      // Solid, opaque tails: reference runs are saturated lines, not faint threads.
-      trailAmt:(0.85+Math.random()*0.6)*clamp(0.5+src*0.6,0.4,1.6),
-      beadRad:wid*2.6+2.0,                          // bulb clearly wider than the tail
-      beadAmt:(1.5+Math.random()*0.9)*clamp(0.5+src*0.6,0.4,1.6),
+      x,y,dirx,diry,seed:Math.random()*1000,steps:0,
+      width:1.2+Math.random()*(1+V.dripSize*0.3),
+      // Carry a full bead of pigment, not a fraction of one: a real run drags a concentrated
+      // line of colour down with it, which is what makes drips read as drips.
+      wet:clamp(L.wet[i]*0.8,0,1.6), pigment:clamp(L.pd[i]*1.15,0,2),
       pr:L.pr[i],pg:L.pg[i],pb:L.pb[i],
-      life:50+V.dripLength*13+Math.round(Math.random()*40),
+      life:40+V.dripLength*10,
     });
-    // The bead takes paint with it, so the edge it left drains slightly.
-    L.pd[i]=Math.max(0,L.pd[i]*0.82);
-    L.wet[i]=Math.max(0,L.wet[i]*0.9);
     if(L.rivulets.length>=maxActive) break;
   }
-  return had||L.rivulets.length>0;
+  return hadRivuletsBefore||L.rivulets.length>0;
 }
 function recomputeBounds(L){
   const b=L.wetBounds; if(!b) return;
