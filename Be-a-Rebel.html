@@ -442,7 +442,7 @@ select{background:var(--input-bg);border:1px solid var(--line);color:var(--text)
   <div class="statusbar">
     <span id="statusText">Ready</span>
     <span id="pressureReadout" class="tinyNote" title="Live pen pressure reaching the browser (Preferences > Tablet)"></span>
-    <span id="statusHint" class="tinyNote">Rebelle-style pigment/water engine — original implementation</span>
+
   </div>
 </div>
 
@@ -4884,13 +4884,33 @@ function render(force){
   drawOverlays();
   refreshLiveThumbnails();
 }
+// Tracks whether the last overlay pass painted Symmetry/Perspective guide lines, so that the
+// frame they get switched OFF still performs one clearing pass.
+let overlayHadGuides=false;
 function drawOverlays(){
   syncOverlayGeometry();
   const kind=TOOLS_BY_ID[currentTool].kind;
+  const wantGuides = symmetry.enabled || perspectiveRuler.enabled;
   if(kind==='transform' && transformState) renderTransformOverlay();
   else if(kind==='selection' && selDraft) renderSelectionDraftPreview();
-  else if(symmetry.enabled || perspectiveRuler.enabled){ renderSelectionOverlay(); if(symmetry.enabled) renderSymmetryOverlay(); if(perspectiveRuler.enabled) renderPerspectiveOverlay(); }
-  else if(selOverlayDirty){ renderSelectionOverlay(); selOverlayDirty=false; }
+  else if(wantGuides){
+    renderSelectionOverlay();
+    if(symmetry.enabled) renderSymmetryOverlay();
+    if(perspectiveRuler.enabled) renderPerspectiveOverlay();
+    overlayHadGuides=true;
+  }
+  // BUG FIX: turning Symmetry (or Perspective) off left its dashed guides painted on the canvas
+  // forever. Nothing in this function ever cleared the overlay unless `selOverlayDirty` happened
+  // to be set — and toggling a guide off does not set it — so with no selection in play the
+  // stale lines simply stayed on screen while the toolbar button correctly showed "off".
+  // renderSelectionOverlay() clears the overlay canvas before it draws, so calling it once on the
+  // switch-off frame wipes the guides. Covers every route that can disable them: the top-bar
+  // button, the Rulers panel checkboxes, and project load.
+  else if(selOverlayDirty || overlayHadGuides){
+    renderSelectionOverlay();
+    selOverlayDirty=false;
+    overlayHadGuides=false;
+  }
 }
 function renderPerspectiveOverlay(){
   if(!selMaskOverlayCtx) return;
@@ -6292,13 +6312,16 @@ function buildRulers(){
   document.getElementById('snapChk').onchange=e=>{ snapToGrid=e.target.checked; };
   document.getElementById('gridSizeSlider').oninput=e=>{ gridSize=+e.target.value; document.getElementById('gridSizeOut').textContent=gridSize; updateGridCss(); };
   document.getElementById('lineAssistChk').onchange=e=>{ straightLineAssist=e.target.checked; };
-  document.getElementById('perspChk').onchange=e=>{ perspectiveRuler.enabled=e.target.checked; markFullDirty(); render(true); };
+  document.getElementById('perspChk').onchange=e=>{ perspectiveRuler.enabled=e.target.checked; markFullDirty(); render(true); buildQuickbar(); };
   document.getElementById('perspModeSel').onchange=e=>{ perspectiveRuler.mode=e.target.value; markFullDirty(); render(true); };
   document.getElementById('perspRecenter').onclick=()=>{
     perspectiveRuler.vp1={x:W/2,y:H*0.3}; perspectiveRuler.vp2={x:W*0.15,y:H*0.3};
     markFullDirty(); render(true); setStatus('Vanishing points reset');
   };
-  document.getElementById('symChk').onchange=e=>{ symmetry.enabled=e.target.checked; };
+  // Also had no repaint at all, so ticking this box did nothing visible until some unrelated
+  // action happened to trigger a render. Now repaints immediately and keeps the top-bar
+  // Symmetry button's highlighted state in sync with it.
+  document.getElementById('symChk').onchange=e=>{ symmetry.enabled=e.target.checked; markFullDirty(); render(true); buildQuickbar(); };
   document.getElementById('symModeSel').onchange=e=>{ symmetry.mode=e.target.value; document.getElementById('symAxesRow').style.display=(symmetry.mode==='radial')?'':'none'; };
   document.getElementById('symAxesSlider').oninput=e=>{ symmetry.axes=+e.target.value; document.getElementById('symAxesOut').textContent=symmetry.axes; };
   document.getElementById('symRecenter').onclick=()=>{ symmetry.cx=W/2; symmetry.cy=H/2; setStatus('Symmetry recentered'); };
